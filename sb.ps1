@@ -1,5 +1,5 @@
 # sb.ps1 - sing-box 模式切换启动器 (Windows)
-# 用法：sb [-c config_file] [mixed|tun|stop|status|log|cdn|check|update]
+# 用法：sb [-c config_file] [init|mixed|tun|stop|status|log|cdn|check|update]
 #
 #   mixed  (默认) - 绕过大陆IP，系统代理 127.0.0.1:<port>
 #   tun            - 绕过大陆IP，TUN 全局接管（需要管理员权限）
@@ -33,9 +33,14 @@ $CorpBypassFile = Join-Path $Dir "corp-bypass-domains.txt"
 if ($ConfigFile) { Write-Host "配置文件: $(Split-Path -Leaf $BaseConfig)" }
 
 # --- 从配置读取代理端口 ---
-$configJson = Get-Content $BaseConfig -Raw | ConvertFrom-Json
-$ProxyPort = ($configJson.inbounds | Where-Object { $_.type -eq "mixed" }).listen_port
-Write-Host "代理端口: $ProxyPort"
+if (Test-Path $BaseConfig) {
+    $configJson = Get-Content $BaseConfig -Raw | ConvertFrom-Json
+    $ProxyPort = ($configJson.inbounds | Where-Object { $_.type -eq "mixed" }).listen_port
+    Write-Host "代理端口: $ProxyPort"
+} elseif ($Command -notin @("init")) {
+    Write-Host "Error: $(Split-Path -Leaf $BaseConfig) 不存在，运行 'sb init' 生成配置"
+    exit 1
+}
 
 # --- 检测默认网络接口 ---
 $DefaultIface = try {
@@ -88,14 +93,14 @@ function Disable-SystemProxy {
 # --- 进程管理 ---
 function Stop-SingBox {
     if (Test-Path $PidFile) {
-        $pid = [int](Get-Content $PidFile -Raw).Trim()
-        $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+        $sbPid = [int](Get-Content $PidFile -Raw).Trim()
+        $proc = Get-Process -Id $sbPid -ErrorAction SilentlyContinue
         if ($proc) {
-            Write-Host "停止 sing-box (PID $pid)..."
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            Write-Host "停止 sing-box (PID $sbPid)..."
+            Stop-Process -Id $sbPid -Force -ErrorAction SilentlyContinue
             # 等待退出
             for ($i = 0; $i -lt 10; $i++) {
-                if (-not (Get-Process -Id $pid -ErrorAction SilentlyContinue)) { break }
+                if (-not (Get-Process -Id $sbPid -ErrorAction SilentlyContinue)) { break }
                 Start-Sleep -Milliseconds 300
             }
         }
@@ -108,8 +113,8 @@ function Stop-SingBox {
 function Show-Status {
     if ((Test-Path $PidFile) -and (Get-Process -Id ([int](Get-Content $PidFile -Raw).Trim()) -ErrorAction SilentlyContinue)) {
         $mode = if (Test-Path $ModeFile) { (Get-Content $ModeFile -Raw).Trim() } else { "unknown" }
-        $pid = (Get-Content $PidFile -Raw).Trim()
-        Write-Host "sing-box 运行中 (PID $pid, 模式: $mode)"
+        $sbPid = (Get-Content $PidFile -Raw).Trim()
+        Write-Host "sing-box 运行中 (PID $sbPid, 模式: $mode)"
     } else {
         Write-Host "sing-box 未运行"
         Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
@@ -156,6 +161,81 @@ function Test-Admin {
 # ==================== 命令分发 ====================
 
 switch ($Command) {
+    "init" {
+        $profile = $Arg2
+        if ($profile) {
+            $envFile = Join-Path $PWD ".env.$profile"
+            $outFile = Join-Path $PWD "config-$profile.json"
+        } else {
+            $envFile = Join-Path $PWD ".env"
+            $outFile = Join-Path $PWD "config.json"
+        }
+        $tplFile = Join-Path $Dir "config.template.json"
+
+        if (-not (Test-Path $envFile)) {
+            Write-Host "Error: $envFile 不存在"
+            Write-Host "请复制 .env.example 并填入真实值"
+            exit 1
+        }
+        if (-not (Test-Path $tplFile)) {
+            Write-Host "Error: 模板 $tplFile 不存在"
+            exit 1
+        }
+
+        # 解析 .env
+        $env = @{}
+        Get-Content $envFile | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -and -not $line.StartsWith('#')) {
+                $idx = $line.IndexOf('=')
+                if ($idx -gt 0) {
+                    $key = $line.Substring(0, $idx).Trim()
+                    $value = $line.Substring($idx + 1).Trim()
+                    $env[$key] = $value
+                }
+            }
+        }
+
+        # CDN_UUID fallback
+        if (-not $env['CDN_UUID']) { $env['CDN_UUID'] = $env['VLESS_UUID'] }
+
+        # 替换模板中的 ${VAR}
+        $content = Get-Content $tplFile -Raw
+        $content = [regex]::Replace($content, '\$\{(\w+)\}', {
+            param($m)
+            $key = $m.Groups[1].Value
+            if ($env.ContainsKey($key)) { return $env[$key] }
+            Write-Host "  Warning: `${$key} 未在 .env 中定义" -ForegroundColor Yellow
+            return $m.Value
+        })
+
+        # 解析 JSON，处理空 shadowtls 密码
+        $config = $content | ConvertFrom-Json
+        if (-not $env['SS_CLIENT_PASSWORD']) {
+            # 找到 reality outbound，改 tag 为 proxy
+            $reality = $config.outbounds | Where-Object { $_.tag -eq 'proxy-reality' }
+            if ($reality) { $reality.tag = 'proxy' }
+            # 移除 urltest + shadowtls 相关 outbound
+            $removeTags = @('proxy-shadowtls', 'shadowtls-out')
+            $config.outbounds = @($config.outbounds | Where-Object {
+                $_.tag -notin $removeTags -and -not ($_.tag -eq 'proxy' -and $_.type -eq 'urltest')
+            })
+        }
+
+        $config | ConvertTo-Json -Depth 20 | Set-Content $outFile -Encoding UTF8
+
+        # 验证
+        $check = & sing-box check -c $outFile 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "$(Split-Path -Leaf $outFile) 已生成（配置验证通过）"
+        } else {
+            Write-Host "$(Split-Path -Leaf $outFile) 已生成，但配置验证失败："
+            Write-Host $check
+            exit 1
+        }
+        exit 0
+    }
+
     "stop" {
         if (Test-Path $ModeFile) {
             $m = (Get-Content $ModeFile -Raw).Trim()
@@ -458,8 +538,9 @@ switch ($Command) {
     }
 
     default {
-        Write-Host "用法: sb [-c config_file] [mixed|tun|stop|status|log|cdn|check|update]"
+        Write-Host "用法: sb [-c config_file] [init|mixed|tun|stop|status|log|cdn|check|update]"
         Write-Host ""
+        Write-Host "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
         Write-Host "  -c file        指定配置文件（默认 config.json）"
         Write-Host "  mixed  (默认) 绕过大陆IP，系统代理 127.0.0.1:$ProxyPort"
         Write-Host "  tun            绕过大陆IP，TUN 全局接管（需要管理员）"

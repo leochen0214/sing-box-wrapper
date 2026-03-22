@@ -5,6 +5,7 @@
 
 # 生成的配置（由 sb init 从模板 + .env 生成）及备份
 config.json
+config-*.json
 config.json.*
 config.*.json
 !config.template.json

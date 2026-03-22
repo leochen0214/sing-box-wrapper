@@ -17,7 +17,7 @@ CLAUDE_DOMAINS_FILE="$DIR/proxy-domains.txt"
 CORP_BYPASS_FILE="$DIR/corp-bypass-domains.txt"
 
 # 解析 -c 参数（指定配置文件）
-_CONFIG_FLAG=""
+_CONFIG_FLAG=()
 while getopts "c:" opt; do
     case $opt in
         c)
@@ -26,7 +26,7 @@ while getopts "c:" opt; do
             else
                 BASE_CONFIG="$PWD/$OPTARG"
             fi
-            _CONFIG_FLAG="-c $BASE_CONFIG"
+            _CONFIG_FLAG=("-c" "$BASE_CONFIG")
             ;;
         *) echo "用法: sb [-c config_file] [command]"; exit 1 ;;
     esac
@@ -51,7 +51,7 @@ PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]
 # 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
 DEFAULT_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
 
-[ -n "$_CONFIG_FLAG" ] && echo "配置文件: $(basename "$BASE_CONFIG")"
+[ ${#_CONFIG_FLAG[@]} -gt 0 ] && echo "配置文件: $(basename "$BASE_CONFIG")"
 [ -n "$PROXY_PORT" ] && echo "代理端口: $PROXY_PORT, 默认接口: $DEFAULT_IFACE"
 
 enable_system_proxy() {
@@ -59,10 +59,10 @@ enable_system_proxy() {
     networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
     # 公司域名绕过代理，避免安全监控看到 sing-box 请求公司服务
     if [ -f "$CORP_BYPASS_FILE" ]; then
-        local domains
-        domains=$(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$' | tr '\n' ' ')
-        if [ -n "$domains" ]; then
-            networksetup -setproxybypassdomains Wi-Fi $domains
+        local -a domains_arr
+        mapfile -t domains_arr < <(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$')
+        if [ ${#domains_arr[@]} -gt 0 ]; then
+            networksetup -setproxybypassdomains Wi-Fi "${domains_arr[@]}"
         fi
     fi
     echo "系统代理已开启 (127.0.0.1:$PROXY_PORT)"
@@ -122,12 +122,13 @@ _sb_init() {
     local env_file tpl out
 
     if [ -n "$profile" ]; then
-        env_file="$DIR/.env.${profile}"
+        env_file="$PWD/.env.${profile}"
+        out="$PWD/config-${profile}.json"
     else
-        env_file="$DIR/.env"
+        env_file="$PWD/.env"
+        out="$PWD/config.json"
     fi
     tpl="$DIR/config.template.json"
-    out="$DIR/config.json"
 
     if [ ! -f "$env_file" ]; then
         echo "Error: $env_file 不存在"
@@ -208,10 +209,113 @@ case "$CMD" in
         _sb_init "${2:-}"
         exit 0
         ;;
+    import)
+        profile="${2:-}"
+        # 解析 --ssh 参数位置
+        ssh_host=""
+        if [ -n "$profile" ] && [ "${3:-}" = "--ssh" ]; then
+            ssh_host="${4:-}"
+        elif [ "${2:-}" = "--ssh" ]; then
+            ssh_host="${3:-}"
+            profile=""
+        fi
+        # 确定 env 文件（当前工作目录）
+        if [ -n "$profile" ]; then
+            env_file="$PWD/.env.${profile}"
+        else
+            env_file="$PWD/.env"
+        fi
+        if [ ! -f "$env_file" ]; then
+            echo "Error: $env_file 不存在，请先创建并填写 VPS_IP"
+            echo ""
+            echo "用法: sb import [name] [--ssh <alias>]"
+            echo "  sb import              # 读取 .env 中的 VPS_IP"
+            echo "  sb import dmit         # 读取 .env.dmit 中的 VPS_IP"
+            echo "  sb import --ssh dmit   # 读取 .env，用 SSH alias 连接"
+            exit 1
+        fi
+        # 读取 VPS_IP
+        vps_ip=$(grep '^VPS_IP=' "$env_file" | head -1 | cut -d= -f2)
+        if [ -z "$vps_ip" ]; then
+            echo "Error: $env_file 中未找到 VPS_IP"
+            exit 1
+        fi
+        # 确定 SSH 连接目标
+        if [ -n "$ssh_host" ]; then
+            ssh_target="$ssh_host"
+        else
+            ssh_target="root@$vps_ip"
+        fi
+        echo "从 $ssh_target 提取 s-ui 凭据..."
+        # 写远程脚本到临时文件，通过 ssh stdin 传递
+        _import_tmp=$(mktemp)
+        cat > "$_import_tmp" << 'PYEOF'
+import sqlite3, json, sys
+db = "/usr/local/s-ui/db/s-ui.db"
+conn = sqlite3.connect(db)
+result = {}
+row = conn.execute("SELECT config FROM clients LIMIT 1").fetchone()
+if row and row[0]:
+    client = json.loads(row[0])
+    result["VLESS_UUID"] = client.get("vless", {}).get("uuid", "")
+    result["SHADOWTLS_PASSWORD"] = client.get("shadowtls", {}).get("password", "")
+    ss_client = client.get("shadowsocks16", {}).get("password", "")
+    if ss_client:
+        result["SS_CLIENT_PASSWORD"] = f"{ss_client}:{ss_client}"
+for row in conn.execute("SELECT tag, out_json, options FROM inbounds"):
+    tag, out_json_raw, options_raw = row
+    out_json = json.loads(out_json_raw) if out_json_raw else {}
+    options = json.loads(options_raw) if options_raw else {}
+    if tag == "vless-reality":
+        tls = out_json.get("tls", {})
+        reality = tls.get("reality", {})
+        result["REALITY_PUBLIC_KEY"] = reality.get("public_key", "")
+        result["REALITY_SHORT_ID"] = reality.get("short_id", "")
+        result["REALITY_SNI"] = tls.get("server_name", "")
+    elif tag == "shadowtls-in":
+        result["SHADOWTLS_SNI"] = options.get("handshake", {}).get("server", "")
+    elif tag == "vless-ws-in":
+        result["CDN_DOMAIN"] = out_json.get("tls", {}).get("server_name", "")
+conn.close()
+# 缺失字段给默认值
+result.setdefault("SHADOWTLS_SNI", "")
+result.setdefault("CDN_DOMAIN", "")
+for k, v in result.items():
+    print(f"{k}={v}")
+PYEOF
+        credentials=$(ssh "$ssh_target" "python3 -" < "$_import_tmp")
+        rm -f "$_import_tmp"
+        if [ $? -ne 0 ]; then
+            echo "Error: SSH 连接或数据库读取失败"
+            exit 1
+        fi
+        # 保留原有 CDN_IP 和 CDN_DOMAIN（如果提取结果为空）
+        cdn_ip=$(grep '^CDN_IP=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2 || true)
+        cdn_ip="${cdn_ip:-141.101.114.1}"
+        existing_cdn_domain=$(grep '^CDN_DOMAIN=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2 || true)
+        # 从提取结果中读取 CDN_DOMAIN，为空则用已有值
+        extracted_cdn_domain=$(echo "$credentials" | grep '^CDN_DOMAIN=' | head -1 | cut -d= -f2)
+        cdn_domain="${extracted_cdn_domain:-$existing_cdn_domain}"
+        # 移除 credentials 中的 CDN_DOMAIN（后面单独写入）
+        credentials=$(echo "$credentials" | grep -v '^CDN_DOMAIN=')
+        {
+            echo "# ${profile} VPS (${vps_ip})"
+            echo "VPS_IP=${vps_ip}"
+            echo "$credentials"
+            echo "CDN_IP=${cdn_ip}"
+            echo "CDN_DOMAIN=${cdn_domain}"
+        } > "$env_file"
+        echo ""
+        echo "已写入 $env_file:"
+        cat "$env_file" | sed 's/^/  /'
+        echo ""
+        echo "下一步: sb init${profile:+ $profile}"
+        exit 0
+        ;;
     stop)
         # mixed/claude 模式关闭系统代理
         if [ -f "$MODE_FILE" ]; then
-            local m; m=$(cat "$MODE_FILE")
+            m=$(cat "$MODE_FILE")
             [ "$m" = "mixed" ] || [ "$m" = "claude" ] && disable_system_proxy
         fi
         stop_singbox
@@ -245,7 +349,7 @@ with open('$BASE_CONFIG', 'w') as f:
         if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && [ -f "$MODE_FILE" ]; then
             mode=$(cat "$MODE_FILE")
             echo "重启 $mode 模式以生效..."
-            exec "$0" $_CONFIG_FLAG "$mode"
+            exec "$0" "${_CONFIG_FLAG[@]}" "$mode"
         else
             echo "sing-box 未运行，下次启动时生效"
         fi
@@ -436,7 +540,7 @@ with open('$BASE_CONFIG', 'w') as f:
         if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && [ -f "$MODE_FILE" ]; then
             mode=$(cat "$MODE_FILE")
             echo "重启 $mode 模式以生效..."
-            exec "$0" $_CONFIG_FLAG "$mode"
+            exec "$0" "${_CONFIG_FLAG[@]}" "$mode"
         else
             echo "下次启动时生效"
         fi
@@ -562,9 +666,10 @@ print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
     mixed|tun|claude)
         ;;
     *)
-        echo "用法: sb [-c config_file] [init|mixed|tun|claude|stop|status|log|cdn|check|update]"
+        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update]"
         echo ""
         echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
+        echo "  import [name]  从 VPS 提取 s-ui 凭据到 .env[.name]"
         echo "  -c file        指定配置文件（默认 config.json）"
         echo "  mixed  (默认) 绕过大陆IP，系统代理 127.0.0.1:$PROXY_PORT"
         echo "  tun            绕过大陆IP，TUN 全局接管（需要 root）"
@@ -714,15 +819,22 @@ echo "$CMD" > "$MODE_FILE"
 
 if [ "$CMD" = "tun" ]; then
     sudo sing-box run -c "$RUN_CONFIG" -D "$DIR" &
-    echo $! > "$PID_FILE"
 else
     sing-box run -c "$RUN_CONFIG" -D "$DIR" &
-    echo $! > "$PID_FILE"
 fi
 
-# 等待确认启动成功
+# 等待 sing-box 进程出现，获取真实 PID（sudo 会 fork，$! 是 sudo 的 PID）
 sleep 1
-if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+sb_pid=$(pgrep -f "sing-box run -c $RUN_CONFIG" 2>/dev/null | head -1)
+if [ -n "$sb_pid" ]; then
+    echo "$sb_pid" > "$PID_FILE"
+else
+    # fallback 到 $!
+    echo $! > "$PID_FILE"
+    sb_pid=$!
+fi
+
+if kill -0 "$sb_pid" 2>/dev/null; then
     echo "sing-box 已启动 (PID $(cat "$PID_FILE"))"
     [ "$CMD" = "mixed" ] || [ "$CMD" = "claude" ] && enable_system_proxy
 else
@@ -743,4 +855,8 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM
-wait "$(cat "$PID_FILE")" 2>/dev/null
+# wait 只能等待当前 shell 的子进程；TUN 模式下 sing-box 是 sudo 的子进程
+# 改用轮询检测进程是否存活
+while kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; do
+    sleep 1
+done
