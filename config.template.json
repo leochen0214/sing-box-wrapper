@@ -1,0 +1,238 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "remote",
+        "type": "tcp",
+        "server": "8.8.8.8",
+        "detour": "proxy"
+      },
+      {
+        "tag": "local",
+        "type": "udp",
+        "server": "223.5.5.5"
+      }
+    ],
+    "strategy": "prefer_ipv4",
+    "rules": [
+      {
+        "action": "reject",
+        "rule_set": [
+          "geosite-category-ads-all"
+        ]
+      },
+      {
+        "server": "local",
+        "rule_set": [
+          "geosite-cn",
+          "geosite-geolocation-cn"
+        ]
+      }
+    ],
+    "final": "remote"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": [
+        "172.18.0.1/30"
+      ],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "gvisor",
+      "route_exclude_address": [
+        "${VPS_IP}/32"
+      ]
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 10887
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "proxy",
+      "outbounds": [
+        "proxy-shadowtls",
+        "proxy-reality"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 100,
+      "interrupt_exist_connections": true
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "proxy-shadowtls",
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "${SS_CLIENT_PASSWORD}",
+      "multiplex": {
+        "enabled": true,
+        "max_connections": 4
+      },
+      "detour": "shadowtls-out"
+    },
+    {
+      "type": "shadowtls",
+      "tag": "shadowtls-out",
+      "server": "${VPS_IP}",
+      "server_port": 443,
+      "version": 3,
+      "password": "${SHADOWTLS_PASSWORD}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${SHADOWTLS_SNI}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-reality",
+      "server": "${VPS_IP}",
+      "server_port": 443,
+      "uuid": "${VLESS_UUID}",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_SNI}",
+        "insecure": false,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "${REALITY_PUBLIC_KEY}",
+          "short_id": "${REALITY_SHORT_ID}"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "vless",
+      "tag": "proxy-cdn",
+      "server": "${CDN_IP}",
+      "server_port": 443,
+      "uuid": "${CDN_UUID}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${CDN_DOMAIN}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/ws",
+        "headers": {
+          "Host": "${CDN_DOMAIN}"
+        }
+      }
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local",
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "action": "reject",
+        "network": [
+          "udp"
+        ],
+        "port": [
+          443
+        ]
+      },
+      {
+        "action": "reject",
+        "rule_set": [
+          "geosite-category-ads-all"
+        ]
+      },
+      {
+        "outbound": "direct",
+        "ip_is_private": true
+      },
+      {
+        "outbound": "direct",
+        "rule_set": [
+          "geosite-private"
+        ]
+      },
+      {
+        "outbound": "direct",
+        "rule_set": [
+          "geoip-cn"
+        ]
+      },
+      {
+        "outbound": "direct",
+        "rule_set": [
+          "geosite-cn"
+        ]
+      }
+    ],
+    "rule_set": [
+      {
+        "tag": "geosite-private",
+        "type": "local",
+        "format": "binary",
+        "path": "ruleset/geosite-private.srs"
+      },
+      {
+        "tag": "geosite-cn",
+        "type": "local",
+        "format": "binary",
+        "path": "ruleset/geosite-cn.srs"
+      },
+      {
+        "tag": "geoip-cn",
+        "type": "local",
+        "format": "binary",
+        "path": "ruleset/geoip-cn.srs"
+      },
+      {
+        "tag": "geosite-geolocation-cn",
+        "type": "local",
+        "format": "binary",
+        "path": "ruleset/geosite-geolocation-cn.srs"
+      },
+      {
+        "tag": "geosite-category-ads-all",
+        "type": "local",
+        "format": "binary",
+        "path": "ruleset/geosite-category-ads-all.srs"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "cache.db"
+    }
+  }
+}

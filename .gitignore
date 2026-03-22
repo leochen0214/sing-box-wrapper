@@ -1,0 +1,31 @@
+# 敏感信息（.env、.env.dmit、.env.vps 等）
+.env
+.env.*
+!.env.example
+
+# 生成的配置（由 sb init 从模板 + .env 生成）及备份
+config.json
+config.json.*
+config.*.json
+!config.template.json
+!config.*.template.json
+
+# 运行时文件
+.config-run.json
+.sing-box.pid
+.sing-box.log
+.current-mode
+cache.db
+
+# CDN 优选缓存
+cdn-ips.txt
+
+# WireGuard 配置（含密钥）
+wgcf-*.toml
+wgcf-*.conf
+
+# 公司绕过域名（本地特定）
+corp-bypass-domains.txt
+
+# 脚本备份
+*.bak

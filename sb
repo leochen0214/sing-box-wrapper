@@ -1,0 +1,746 @@
+#!/bin/bash
+# sb - sing-box 模式切换启动器
+# 用法：sb [-c config_file] [mixed|tun|claude|stop|status|update]
+#
+#   mixed  (默认) - 绕过大陆IP，系统代理 127.0.0.1:<port>（端口从 config.json 读取）
+#   tun            - 绕过大陆IP，TUN 全局接管（需要 root）
+#   claude         - 仅 Claude 域名走代理，其余直连（公司网络用）
+
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+BASE_CONFIG="$DIR/config.json"
+RUN_CONFIG="$DIR/.config-run.json"
+PID_FILE="$DIR/.sing-box.pid"
+MODE_FILE="$DIR/.current-mode"
+CLAUDE_DOMAINS_FILE="$DIR/proxy-domains.txt"
+CORP_BYPASS_FILE="$DIR/corp-bypass-domains.txt"
+
+# 解析 -c 参数（指定配置文件）
+_CONFIG_FLAG=""
+while getopts "c:" opt; do
+    case $opt in
+        c)
+            if [[ "$OPTARG" = /* ]]; then
+                BASE_CONFIG="$OPTARG"
+            else
+                BASE_CONFIG="$PWD/$OPTARG"
+            fi
+            _CONFIG_FLAG="-c $BASE_CONFIG"
+            ;;
+        *) echo "用法: sb [-c config_file] [command]"; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# 配置文件不存在时提示 init（init 命令本身不需要 config.json）
+if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ]; then
+    if [ -f "$DIR/config.template.json" ]; then
+        echo "Error: $(basename "$BASE_CONFIG") 不存在"
+        echo "运行 'sb init' 从模板生成配置"
+        exit 1
+    else
+        echo "Error: $(basename "$BASE_CONFIG") 不存在"
+        exit 1
+    fi
+fi
+
+# 从配置文件读取 mixed 入站端口（唯一配置源）
+PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG" 2>/dev/null)
+
+# 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
+DEFAULT_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+
+[ -n "$_CONFIG_FLAG" ] && echo "配置文件: $(basename "$BASE_CONFIG")"
+[ -n "$PROXY_PORT" ] && echo "代理端口: $PROXY_PORT, 默认接口: $DEFAULT_IFACE"
+
+enable_system_proxy() {
+    networksetup -setwebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
+    networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
+    # 公司域名绕过代理，避免安全监控看到 sing-box 请求公司服务
+    if [ -f "$CORP_BYPASS_FILE" ]; then
+        local domains
+        domains=$(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$' | tr '\n' ' ')
+        if [ -n "$domains" ]; then
+            networksetup -setproxybypassdomains Wi-Fi $domains
+        fi
+    fi
+    echo "系统代理已开启 (127.0.0.1:$PROXY_PORT)"
+}
+
+disable_system_proxy() {
+    networksetup -setwebproxystate Wi-Fi off
+    networksetup -setsecurewebproxystate Wi-Fi off
+    networksetup -setproxybypassdomains Wi-Fi ""
+    echo "系统代理已关闭"
+}
+
+stop_singbox() {
+    local is_tun=false
+    [ -f "$MODE_FILE" ] && [ "$(cat "$MODE_FILE")" = "tun" ] && is_tun=true
+
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "停止 sing-box (PID $pid)..."
+            if $is_tun; then
+                sudo kill "$pid" 2>/dev/null || true
+            else
+                kill "$pid" 2>/dev/null || true
+            fi
+            # 等待进程退出
+            for i in $(seq 1 10); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.3
+            done
+        fi
+        rm -f "$PID_FILE"
+    fi
+    # 兜底：清理残留进程
+    pkill -f "sing-box run -c $RUN_CONFIG" 2>/dev/null || true
+    $is_tun && sudo pkill -f "sing-box run -c $RUN_CONFIG" 2>/dev/null || true
+}
+
+show_status() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        local mode="unknown"
+        [ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE")
+        echo "sing-box 运行中 (PID $(cat "$PID_FILE"), 模式: $mode)"
+    else
+        echo "sing-box 未运行"
+        rm -f "$PID_FILE"
+    fi
+    return 0
+}
+
+CMD="${1:-mixed}"
+
+# sb init 子命令：从模板 + .env 生成 config.json
+_sb_init() {
+    local profile="${1:-}"
+    local env_file tpl out
+
+    if [ -n "$profile" ]; then
+        env_file="$DIR/.env.${profile}"
+    else
+        env_file="$DIR/.env"
+    fi
+    tpl="$DIR/config.template.json"
+    out="$DIR/config.json"
+
+    if [ ! -f "$env_file" ]; then
+        echo "Error: $env_file 不存在"
+        echo "可用的 .env 文件："
+        ls -1 "$DIR"/.env.* 2>/dev/null | sed 's/.*\/.env\./  sb init /'
+        exit 1
+    fi
+    if [ ! -f "$tpl" ]; then
+        echo "Error: 模板 $tpl 不存在"
+        exit 1
+    fi
+
+    # 读取 .env，替换 ${VAR}，CDN_UUID 不存在时 fallback 到 VLESS_UUID
+    python3 - "$env_file" "$tpl" "$out" << 'INIT_EOF'
+import sys, re, json
+
+env_file, tpl_file, out_file = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# 解析 .env
+env = {}
+with open(env_file) as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, _, value = line.partition('=')
+        env[key.strip()] = value.strip()
+
+# CDN_UUID fallback 到 VLESS_UUID
+if 'CDN_UUID' not in env or not env['CDN_UUID']:
+    env['CDN_UUID'] = env.get('VLESS_UUID', '')
+
+# 读取模板并替换 ${VAR}
+with open(tpl_file) as f:
+    content = f.read()
+
+def replace_var(m):
+    key = m.group(1)
+    if key not in env:
+        print(f"  Warning: ${{{key}}} 未在 .env 中定义", file=sys.stderr)
+        return m.group(0)
+    return env[key]
+
+content = re.sub(r'\$\{(\w+)\}', replace_var, content)
+
+# 解析为 JSON 对象处理
+config = json.loads(content)
+
+# 如果 shadowtls 密码为空，移除相关 outbound 并简化 proxy
+ss_pw = env.get('SS_CLIENT_PASSWORD', '')
+if not ss_pw:
+    remove_tags = {'proxy', 'proxy-shadowtls', 'shadowtls-out', 'proxy-reality'}
+    # 先移除所有相关 outbound
+    kept = [ob for ob in config['outbounds'] if ob.get('tag') not in remove_tags]
+    # 找 reality outbound，改 tag 为 proxy，插到最前面
+    reality = next((ob for ob in config['outbounds'] if ob.get('tag') == 'proxy-reality'), None)
+    if reality:
+        reality['tag'] = 'proxy'
+        kept.insert(0, reality)
+    config['outbounds'] = kept
+
+with open(out_file, 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+INIT_EOF
+
+    # 验证生成的配置
+    if sing-box check -c "$out" 2>/dev/null; then
+        echo "$(basename "$out") 已生成（配置验证通过）"
+    else
+        echo "$(basename "$out") 已生成，但配置验证失败："
+        sing-box check -c "$out" 2>&1
+        exit 1
+    fi
+}
+
+case "$CMD" in
+    init)
+        _sb_init "${2:-}"
+        exit 0
+        ;;
+    stop)
+        # mixed/claude 模式关闭系统代理
+        if [ -f "$MODE_FILE" ]; then
+            local m; m=$(cat "$MODE_FILE")
+            [ "$m" = "mixed" ] || [ "$m" = "claude" ] && disable_system_proxy
+        fi
+        stop_singbox
+        rm -f "$MODE_FILE"
+        echo "已停止"
+        exit 0
+        ;;
+    status)
+        show_status
+        exit 0
+        ;;
+    log)
+        level="${2:-}"
+        if [ "$level" != "info" ] && [ "$level" != "warn" ] && [ "$level" != "error" ] && [ "$level" != "debug" ]; then
+            # 无参数时显示当前级别
+            current=$(python3 -c "import json; print(json.load(open('$BASE_CONFIG'))['log']['level'])")
+            echo "当前日志级别: $current"
+            echo "用法: sb log [info|warn|error|debug]"
+            exit 0
+        fi
+        python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+c['log']['level'] = '$level'
+with open('$BASE_CONFIG', 'w') as f:
+    json.dump(c, f, indent=2, ensure_ascii=False)
+"
+        echo "日志级别已改为: $level"
+        # 如果 sing-box 正在运行，自动重启当前模式
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && [ -f "$MODE_FILE" ]; then
+            mode=$(cat "$MODE_FILE")
+            echo "重启 $mode 模式以生效..."
+            exec "$0" $_CONFIG_FLAG "$mode"
+        else
+            echo "sing-box 未运行，下次启动时生效"
+        fi
+        exit 0
+        ;;
+    cdn)
+        action="${2:-}"
+        CDN_IPS_FILE="$DIR/cdn-ips.txt"
+        # 读取当前 proxy-cdn IP
+        _cdn_current_ip=$(python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+for ob in c['outbounds']:
+    if ob.get('tag') == 'proxy-cdn':
+        print(ob['server']); break
+")
+        # 更新 proxy-cdn IP
+        _cdn_set_ip() {
+            python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+for ob in c['outbounds']:
+    if ob.get('tag') == 'proxy-cdn':
+        ob['server'] = '$1'
+        break
+with open('$BASE_CONFIG', 'w') as f:
+    json.dump(c, f, indent=2, ensure_ascii=False)
+"
+        }
+        # 获取 Cloudflare IP 列表
+        _cdn_fetch_ips() {
+            local ips
+            ips=$(curl -s --noproxy '*' --max-time 5 https://www.cloudflare.com/ips-v4 2>/dev/null \
+                | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' \
+                | python3 -c "
+import sys, ipaddress
+ips = []
+for line in sys.stdin:
+    net = ipaddress.ip_network(line.strip())
+    ips.append(str(net.network_address + 1))
+print(' '.join(ips))
+" 2>/dev/null)
+            if [ -z "$ips" ]; then
+                echo "104.16.0.1 141.101.114.1 162.159.0.1 172.67.0.1 103.21.244.1 108.162.192.1 173.245.48.1 188.114.96.1 190.93.240.1 198.41.128.1"
+            else
+                echo "$ips"
+            fi
+        }
+        # 测试单个 IP 的 WebSocket 连通性，输出 "HTTP状态码 耗时秒"
+        _cdn_test_ip() {
+            curl -s -o /dev/null -w "%{http_code} %{time_total}" \
+                --resolve "nongliba.cc:443:$1" \
+                --noproxy '*' --max-time 5 \
+                -H "Upgrade: websocket" -H "Connection: Upgrade" \
+                -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+                -H "Sec-WebSocket-Version: 13" \
+                https://nongliba.cc/ws 2>/dev/null || echo "000 99.000"
+        }
+        # 并行测试所有 IP，结果保存到 cdn-ips.txt，最优 IP 写入 stdout
+        _cdn_test_all() {
+            local cf_ips tmp_dir
+            echo "获取 Cloudflare IP 列表..." >&2
+            cf_ips=$(_cdn_fetch_ips)
+            # 确保当前 IP 在测试列表中
+            case " $cf_ips " in
+                *" $_cdn_current_ip "*) ;;
+                *) cf_ips="$_cdn_current_ip $cf_ips" ;;
+            esac
+            echo "测试 $(echo $cf_ips | wc -w | tr -d ' ') 个 IP 延迟..." >&2
+            tmp_dir=$(mktemp -d)
+            for ip in $cf_ips; do
+                ( _cdn_test_ip "$ip" > "$tmp_dir/$ip" ) &
+            done
+            wait
+            > "$CDN_IPS_FILE"
+            local best_ip="" best_ms=99999
+            for ip in $cf_ips; do
+                [ -f "$tmp_dir/$ip" ] || continue
+                read -r code time < "$tmp_dir/$ip"
+                local ms=$(awk "BEGIN{printf \"%d\", $time * 1000}")
+                if [ "$code" != "000" ]; then
+                    printf "  %-18s ✓  %dms\n" "$ip" "$ms" >&2
+                    echo "$ip $ms" >> "$CDN_IPS_FILE"
+                    if [ "$ms" -lt "$best_ms" ]; then
+                        best_ip="$ip"; best_ms="$ms"
+                    fi
+                else
+                    printf "  %-18s ✗\n" "$ip" >&2
+                fi
+            done
+            rm -rf "$tmp_dir"
+            sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
+            echo "$best_ip $best_ms"
+        }
+        if [ "$action" = "ip" ]; then
+            echo "当前 CDN IP: $_cdn_current_ip"
+            result=$(_cdn_test_all)
+            best_ip=$(echo "$result" | awk '{print $1}')
+            best_ms=$(echo "$result" | awk '{print $2}')
+            if [ -z "$best_ip" ]; then
+                echo "所有 IP 均不可用"
+                exit 1
+            fi
+            count=$(wc -l < "$CDN_IPS_FILE" | tr -d ' ')
+            echo "已保存 $count 个可用 IP → cdn-ips.txt"
+            # 与当前 IP 对比
+            cur_ms=$(awk -v ip="$_cdn_current_ip" '$1==ip{print $2}' "$CDN_IPS_FILE")
+            if [ -z "$cur_ms" ]; then
+                echo "当前 $_cdn_current_ip 不可用！"
+                _cdn_set_ip "$best_ip"
+                echo "已切换: $_cdn_current_ip → $best_ip (${best_ms}ms)"
+            elif [ "$best_ip" = "$_cdn_current_ip" ]; then
+                echo "当前 $_cdn_current_ip 已是最优 (${cur_ms}ms)"
+            else
+                echo "当前: $_cdn_current_ip (${cur_ms}ms)  最优: $best_ip (${best_ms}ms)"
+            fi
+            exit 0
+        fi
+        if [ "$action" = "list" ]; then
+            if [ ! -f "$CDN_IPS_FILE" ] || [ ! -s "$CDN_IPS_FILE" ]; then
+                echo "无保存的 IP，先运行: sb cdn ip"
+                exit 1
+            fi
+            echo "当前: $_cdn_current_ip"
+            echo "可用 IP（按延迟排序）:"
+            i=1
+            while read -r ip ms; do
+                mark=""
+                [ "$ip" = "$_cdn_current_ip" ] && mark=" ←"
+                printf "  %d) %-18s %sms%s\n" "$i" "$ip" "$ms" "$mark"
+                i=$((i + 1))
+            done < "$CDN_IPS_FILE"
+            exit 0
+        fi
+        if [ "$action" = "set" ]; then
+            target="${3:-}"
+            if [ -z "$target" ]; then
+                echo "用法: sb cdn set <IP 或序号>"
+                exit 1
+            fi
+            # 支持序号（从 cdn-ips.txt 选取）
+            if echo "$target" | grep -qE '^[0-9]+$' && [ "$target" -le 99 ] 2>/dev/null; then
+                if [ -f "$CDN_IPS_FILE" ] && [ -s "$CDN_IPS_FILE" ]; then
+                    line=$(sed -n "${target}p" "$CDN_IPS_FILE")
+                    if [ -n "$line" ]; then
+                        target=$(echo "$line" | awk '{print $1}')
+                    fi
+                fi
+            fi
+            if [ "$target" = "$_cdn_current_ip" ]; then
+                echo "当前已是 $target"
+            else
+                _cdn_set_ip "$target"
+                echo "已更新: $_cdn_current_ip → $target"
+            fi
+            exit 0
+        fi
+        if [ "$action" != "on" ] && [ "$action" != "off" ]; then
+            current=$(python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+print('on' if c.get('_cdn_enabled') else 'off')
+")
+            echo "CDN 中转: $current  IP: $_cdn_current_ip"
+            echo "用法: sb cdn [on|off|ip|list|set]"
+            echo "  on/off    CDN 中转开关"
+            echo "  ip        测试所有 Cloudflare IP 并保存可用列表"
+            echo "  list      查看已保存的可用 IP"
+            echo "  set <N>   切换到第 N 个 IP（序号来自 list）"
+            exit 0
+        fi
+        python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+if '$action' == 'on':
+    c['_cdn_enabled'] = True
+else:
+    c.pop('_cdn_enabled', None)
+with open('$BASE_CONFIG', 'w') as f:
+    json.dump(c, f, indent=2, ensure_ascii=False)
+"
+        if [ "$action" = "on" ]; then echo "CDN 中转已开启"; else echo "CDN 中转已关闭"; fi
+        # 如果 sing-box 正在运行，自动重启当前模式
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && [ -f "$MODE_FILE" ]; then
+            mode=$(cat "$MODE_FILE")
+            echo "重启 $mode 模式以生效..."
+            exec "$0" $_CONFIG_FLAG "$mode"
+        else
+            echo "下次启动时生效"
+        fi
+        exit 0
+        ;;
+    check)
+        target="${2:-}"
+        if [ -z "$target" ]; then
+            # 从配置文件提取所有 VPS IP（outbounds 中的 server 字段，排除 CDN IP）
+            target=$(python3 -c "
+import json
+with open('$BASE_CONFIG') as f:
+    c = json.load(f)
+seen = set()
+for ob in c.get('outbounds', []):
+    ip = ob.get('server', '')
+    # 跳过非直连 IP（CDN、域名等）
+    if ip and ip[0].isdigit() and ip not in seen:
+        # 跳过 proxy-cdn 的 IP
+        if ob.get('tag', '') != 'proxy-cdn':
+            seen.add(ip)
+            print(ip)
+")
+            if [ -z "$target" ]; then
+                echo "未找到 VPS IP，请指定: sb check <IP>"
+                exit 1
+            fi
+        fi
+        for ip in $target; do
+            echo "检测 $ip ..."
+            python3 -c "
+import socket, time, sys
+
+ip = '$ip'
+ports = [443, 8443, 22]
+blocked_count = 0
+
+for port in ports:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5)
+    start = time.time()
+    try:
+        s.connect((ip, port))
+        ms = (time.time() - start) * 1000
+        print(f'  :{port:<5}  ✓ {ms:.0f}ms')
+        s.close()
+    except socket.timeout:
+        print(f'  :{port:<5}  ✗ 超时')
+        blocked_count += 1
+    except ConnectionRefusedError:
+        print(f'  :{port:<5}  ✗ 拒绝连接（端口未开放）')
+    except Exception as e:
+        print(f'  :{port:<5}  ✗ {e}')
+        blocked_count += 1
+
+print()
+if blocked_count == len(ports):
+    print(f'结论: {ip} 大概率被封（所有端口不可达）')
+elif blocked_count > 0:
+    print(f'结论: {ip} 部分端口不可达，可能被针对性封端口')
+else:
+    print(f'结论: {ip} 未被封，如果代理不通则是协议被 DPI 识别')
+"
+        done
+        exit 0
+        ;;
+    update)
+        # 通过本地代理下载（GitHub raw 国内直连不稳定）
+        CURL_PROXY=""
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            CURL_PROXY="-x http://127.0.0.1:$PROXY_PORT"
+            echo "更新规则集（通过代理）..."
+        else
+            echo "更新规则集（直连，sing-box 未运行）..."
+        fi
+        RULESET_DIR="$DIR/ruleset"
+        mkdir -p "$RULESET_DIR"
+        GEOSITE_BASE="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set"
+        GEOIP_BASE="https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set"
+        # 统计 .srs 文件的规则条数
+        count_rules() {
+            local tmp_json
+            tmp_json=$(mktemp)
+            sing-box rule-set decompile -o "$tmp_json" "$1" 2>/dev/null && \
+                python3 -c "
+import json
+with open('$tmp_json') as f:
+    rules = json.load(f)['rules']
+print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
+" 2>/dev/null || echo "?"
+            rm -f "$tmp_json"
+        }
+        # 先下载到临时文件，再原子替换，避免 sing-box 热加载到不完整的文件
+        TMP_DIR=$(mktemp -d)
+        trap "rm -rf $TMP_DIR" EXIT
+        failed=0
+        ALL_FILES="geosite-private geosite-cn geosite-geolocation-cn geosite-category-ads-all geoip-cn"
+        for f in $ALL_FILES; do
+            printf "  %-35s" "$f"
+            # 选择下载源
+            case "$f" in
+                geoip-*) url="$GEOIP_BASE/$f.srs" ;;
+                *)       url="$GEOSITE_BASE/$f.srs" ;;
+            esac
+            if curl $CURL_PROXY -fLo "$TMP_DIR/$f.srs" "$url" 2>/dev/null; then
+                old="?"
+                [ -f "$RULESET_DIR/$f.srs" ] && old=$(count_rules "$RULESET_DIR/$f.srs")
+                new=$(count_rules "$TMP_DIR/$f.srs")
+                echo "$old → $new"
+            else
+                echo "失败"; failed=1
+            fi
+        done
+        if [ "$failed" -eq 0 ]; then
+            mv "$TMP_DIR"/*.srs "$RULESET_DIR/"
+            echo "全部更新完成"
+        else
+            echo "部分文件更新失败，请检查网络（已有文件未被修改）"
+            exit 1
+        fi
+        exit 0
+        ;;
+    mixed|tun|claude)
+        ;;
+    *)
+        echo "用法: sb [-c config_file] [init|mixed|tun|claude|stop|status|log|cdn|check|update]"
+        echo ""
+        echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
+        echo "  -c file        指定配置文件（默认 config.json）"
+        echo "  mixed  (默认) 绕过大陆IP，系统代理 127.0.0.1:$PROXY_PORT"
+        echo "  tun            绕过大陆IP，TUN 全局接管（需要 root）"
+        echo "  claude         仅 Claude 域名走代理，其余直连（公司网络用）"
+        echo "  stop           停止 sing-box"
+        echo "  status         查看运行状态"
+        echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
+        echo "  cdn [on|off|ip|list|set] CDN 中转 / 优选 IP"
+        echo "  check [IP]     检测 IP 是否被封（默认使用配置中的 VPS IP）"
+        echo "  update         更新规则集（geosite/geoip）"
+        exit 1
+        ;;
+esac
+
+# 如果已在运行，先停掉
+if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    old_mode="unknown"
+    [ -f "$MODE_FILE" ] && old_mode=$(cat "$MODE_FILE")
+    echo "切换: $old_mode → $CMD"
+    [ "$old_mode" = "mixed" ] || [ "$old_mode" = "claude" ] && disable_system_proxy
+    stop_singbox
+    sleep 0.5
+fi
+
+# 根据模式生成运行时配置
+python3 -c "
+import json, subprocess
+
+with open('$BASE_CONFIG') as f:
+    config = json.load(f)
+
+# 检测系统 DNS（公司 DHCP 分配的 DNS，用于解析内网域名）
+dns_out = subprocess.check_output(['scutil', '--dns'], text=True)
+sys_dns = None
+for line in dns_out.splitlines():
+    if 'nameserver[0]' in line:
+        sys_dns = line.split(':')[-1].strip()
+        break
+
+default_iface = '$DEFAULT_IFACE' or None
+
+# CDN 中转标志（模式处理后统一替换）
+cdn_enabled = config.pop('_cdn_enabled', False)
+
+if '$CMD' == 'mixed':
+    config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'tun']
+    # 替换 local DNS 为系统 DNS，确保国内域名可解析
+    if sys_dns:
+        for s in config['dns']['servers']:
+            if s['tag'] == 'local':
+                s['server'] = sys_dns
+    # 重排路由规则：域名规则在前 → resolve → IP 规则在后
+    # resolve 会将域名替换为 IP，之后域名规则不再匹配，所以必须先检查域名规则
+    old_rules = config['route']['rules']
+    domain_rules = []  # 域名类规则（含 action 规则如 sniff）
+    ip_rules = []      # IP 类规则
+    for r in old_rules:
+        if r.get('ip_is_private') or r.get('ip_cidr') or any('geoip' in rs for rs in r.get('rule_set', [])):
+            ip_rules.append(r)
+        else:
+            domain_rules.append(r)
+    config['route']['rules'] = domain_rules + [{'action': 'resolve', 'strategy': 'prefer_ipv4'}] + ip_rules
+    # 显式设置默认接口，替代不可靠的 auto_detect_interface
+    if default_iface:
+        config['route'].pop('auto_detect_interface', None)
+        config['route']['default_interface'] = default_iface
+elif '$CMD' == 'claude':
+    # 从配置文件加载域名列表
+    with open('$CLAUDE_DOMAINS_FILE') as df:
+        domains = [line.strip() for line in df if line.strip() and not line.startswith('#')]
+    # 仅保留 mixed 入站
+    config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'tun']
+    # 检测公司 PAC 代理（从 PAC 文件提取 PROXY host:port）
+    corp_proxy = None
+    try:
+        import urllib.request, re
+        pac_url = subprocess.check_output(
+            ['networksetup', '-getautoproxyurl', 'Wi-Fi'], text=True)
+        pac_match = re.search(r'URL:\s*(http\S+)', pac_url)
+        if pac_match:
+            pac_content = urllib.request.urlopen(pac_match.group(1), timeout=3).read().decode()
+            proxy_match = re.search(r'PROXY\s+([\w.-]+):(\d+)', pac_content)
+            if proxy_match:
+                corp_proxy = (proxy_match.group(1), int(proxy_match.group(2)))
+    except Exception:
+        pass
+    # DNS：Claude 域名用 remote，其余用系统 DNS
+    sys_dns = sys_dns or '223.5.5.5'
+    config['dns'] = {
+        'servers': [
+            {'tag': 'remote', 'type': 'tcp', 'server': '8.8.8.8', 'detour': 'proxy'},
+            {'tag': 'local', 'type': 'udp', 'server': sys_dns}
+        ],
+        'rules': [
+            {'domain_suffix': domains, 'server': 'remote'}
+        ],
+        'final': 'local',
+        'strategy': 'prefer_ipv4'
+    }
+    # 路由：Claude 域名走 VPS，内网直连，其余走公司代理（或直连）
+    route_final = 'direct'
+    if corp_proxy:
+        config['outbounds'].append({
+            'type': 'http', 'tag': 'corp-proxy',
+            'server': corp_proxy[0], 'server_port': corp_proxy[1]
+        })
+        route_final = 'corp-proxy'
+    route_iface = {'default_interface': default_iface} if default_iface else {'auto_detect_interface': True}
+    config['route'] = {
+        **route_iface,
+        'default_domain_resolver': 'local',
+        'rules': [
+            {'action': 'sniff'},
+            {'protocol': 'dns', 'action': 'hijack-dns'},
+        ] + [
+            {
+                'outbound': 'proxy',
+                'domain_suffix': domains
+            },
+            {'action': 'resolve', 'strategy': 'prefer_ipv4'},
+            {'outbound': 'direct', 'ip_is_private': True}
+        ],
+        'final': route_final
+    }
+
+# CDN 中转：替换所有 proxy → proxy-cdn（在模式处理之后，确保覆盖 claude 模式重建的 DNS）
+if cdn_enabled:
+    # DNS detour 从 proxy 改为 proxy-cdn
+    for s in config.get('dns', {}).get('servers', []):
+        if s.get('detour') == 'proxy':
+            s['detour'] = 'proxy-cdn'
+    # 路由规则中 outbound: proxy → proxy-cdn
+    for r in config.get('route', {}).get('rules', []):
+        if r.get('outbound') == 'proxy':
+            r['outbound'] = 'proxy-cdn'
+    # 路由 final（未匹配流量的默认出站）
+    route_final = config.get('route', {}).get('final')
+    if route_final is None or route_final == 'proxy':
+        config.setdefault('route', {})['final'] = 'proxy-cdn'
+
+with open('$RUN_CONFIG', 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+"
+
+echo "启动 sing-box ($CMD 模式)..."
+echo "$CMD" > "$MODE_FILE"
+
+if [ "$CMD" = "tun" ]; then
+    sudo sing-box run -c "$RUN_CONFIG" -D "$DIR" &
+    echo $! > "$PID_FILE"
+else
+    sing-box run -c "$RUN_CONFIG" -D "$DIR" &
+    echo $! > "$PID_FILE"
+fi
+
+# 等待确认启动成功
+sleep 1
+if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "sing-box 已启动 (PID $(cat "$PID_FILE"))"
+    [ "$CMD" = "mixed" ] || [ "$CMD" = "claude" ] && enable_system_proxy
+else
+    echo "启动失败，查看日志排查"
+    rm -f "$PID_FILE" "$MODE_FILE"
+    exit 1
+fi
+
+# 前台等待，Ctrl+C 退出时自动清理
+cleanup() {
+    if [ -f "$MODE_FILE" ]; then
+        local m; m=$(cat "$MODE_FILE")
+        [ "$m" = "mixed" ] || [ "$m" = "claude" ] && disable_system_proxy
+    fi
+    stop_singbox
+    rm -f "$MODE_FILE"
+    echo "已停止"
+    exit 0
+}
+trap cleanup INT TERM
+wait "$(cat "$PID_FILE")" 2>/dev/null
