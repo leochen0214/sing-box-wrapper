@@ -34,7 +34,7 @@ done
 shift $((OPTIND - 1))
 
 # 配置文件不存在时提示 init（init 命令本身不需要 config.json）
-if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ]; then
+if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]; then
     if [ -f "$DIR/config.template.json" ]; then
         echo "Error: $(basename "$BASE_CONFIG") 不存在"
         echo "运行 'sb init' 从模板生成配置"
@@ -45,14 +45,15 @@ if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ]; then
     fi
 fi
 
-# 从配置文件读取 mixed 入站端口（唯一配置源）
-PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG" 2>/dev/null)
-
-# 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
-DEFAULT_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
-
-[ ${#_CONFIG_FLAG[@]} -gt 0 ] && echo "配置文件: $(basename "$BASE_CONFIG")"
-[ -n "$PROXY_PORT" ] && echo "代理端口: $PROXY_PORT, 默认接口: $DEFAULT_IFACE"
+# init/import 不需要读取配置和端口信息
+if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]; then
+    # 从配置文件读取 mixed 入站端口（唯一配置源）
+    PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG")
+    # 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
+    DEFAULT_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    [ ${#_CONFIG_FLAG[@]} -gt 0 ] && echo "配置文件: $(basename "$BASE_CONFIG")"
+    [ -n "$PROXY_PORT" ] && echo "代理端口: $PROXY_PORT, 默认接口: $DEFAULT_IFACE"
+fi
 
 enable_system_proxy() {
     networksetup -setwebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
@@ -226,17 +227,28 @@ case "$CMD" in
             env_file="$PWD/.env"
         fi
         if [ ! -f "$env_file" ]; then
-            echo "Error: $env_file 不存在，请先创建并填写 VPS_IP"
-            echo ""
-            echo "用法: sb import [name] [--ssh <alias>]"
-            echo "  sb import              # 读取 .env 中的 VPS_IP"
-            echo "  sb import dmit         # 读取 .env.dmit 中的 VPS_IP"
-            echo "  sb import --ssh dmit   # 读取 .env，用 SSH alias 连接"
-            exit 1
+            if [ -n "$ssh_host" ]; then
+                # --ssh 模式：自动创建 env 文件，从 SSH config 解析 VPS_IP
+                vps_ip=$(ssh -G "$ssh_host" 2>/dev/null | awk '/^hostname /{print $2}')
+                [ -z "$vps_ip" ] && vps_ip="$ssh_host"
+                echo "自动创建 $env_file (VPS_IP=$vps_ip)"
+                echo "VPS_IP=${vps_ip}" > "$env_file"
+            else
+                echo "Error: $env_file 不存在，请先创建并填写 VPS_IP"
+                echo ""
+                echo "用法: sb import [name] [--ssh <alias>]"
+                echo "  sb import              # 读取 .env 中的 VPS_IP"
+                echo "  sb import dmit         # 读取 .env.dmit 中的 VPS_IP"
+                echo "  sb import --ssh dmit   # 读取 .env，用 SSH alias 连接"
+                exit 1
+            fi
         fi
         # 读取 VPS_IP
         vps_ip=$(grep '^VPS_IP=' "$env_file" | head -1 | cut -d= -f2)
-        if [ -z "$vps_ip" ]; then
+        if [ -z "$vps_ip" ] && [ -n "$ssh_host" ]; then
+            vps_ip=$(ssh -G "$ssh_host" 2>/dev/null | awk '/^hostname /{print $2}')
+            [ -z "$vps_ip" ] && vps_ip="$ssh_host"
+        elif [ -z "$vps_ip" ]; then
             echo "Error: $env_file 中未找到 VPS_IP"
             exit 1
         fi
