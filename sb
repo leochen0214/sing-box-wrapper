@@ -8,7 +8,14 @@
 
 set -euo pipefail
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+# 跟随 symlink 解析真实脚本目录
+_SELF="$0"
+if [ -L "$_SELF" ]; then
+    _TARGET="$(readlink "$_SELF")"
+    [[ "$_TARGET" != /* ]] && _TARGET="$(dirname "$_SELF")/$_TARGET"
+    _SELF="$_TARGET"
+fi
+DIR="$(cd "$(dirname "$_SELF")" && pwd)"
 BASE_CONFIG="$DIR/config.json"
 RUN_CONFIG="$DIR/.config-run.json"
 PID_FILE="$DIR/.sing-box.pid"
