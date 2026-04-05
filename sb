@@ -715,10 +715,28 @@ fi
 
 # 根据模式生成运行时配置
 python3 -c "
-import json, subprocess
+import json, subprocess, os
 
 with open('$BASE_CONFIG') as f:
     config = json.load(f)
+
+# 读取域名文件注入自定义路由规则（编辑后重启即生效，无需 sb init）
+def read_domains(filename):
+    filepath = os.path.join('$DIR', filename)
+    if not os.path.isfile(filepath):
+        return []
+    with open(filepath) as f:
+        return [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+
+proxy_domains = read_domains('proxy-domains.txt')
+direct_domains = read_domains('direct-domains.txt')
+rules = config.get('route', {}).get('rules', [])
+if proxy_domains:
+    idx = next((i for i, r in enumerate(rules) if 'geoip-cn' in r.get('rule_set', [])), len(rules))
+    rules.insert(idx, {'outbound': 'proxy', 'domain_suffix': proxy_domains})
+if direct_domains:
+    idx = next((i for i, r in enumerate(rules) if 'geosite-cn' in r.get('rule_set', [])), len(rules) - 1)
+    rules.insert(idx + 1, {'outbound': 'direct', 'domain_suffix': direct_domains})
 
 # 检测系统 DNS（公司 DHCP 分配的 DNS，用于解析内网域名）
 dns_out = subprocess.check_output(['scutil', '--dns'], text=True)

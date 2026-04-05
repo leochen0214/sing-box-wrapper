@@ -1,0 +1,4 @@
+# 强制直连的域名（每行一个）
+# 这些域名会绕过 geoip/geosite 判断，始终走直连
+gsuus.com
+baidu.com

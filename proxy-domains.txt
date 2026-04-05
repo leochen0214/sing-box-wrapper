@@ -1,4 +1,8 @@
+# 始终走代理的域名（每行一个）
+# claude 模式：仅这些域名走代理，其余直连
+# mixed/tun 模式：强制代理（绕过 geoip/geosite 判断）
 claude.ai
 anthropic.com
 platform.claude.com
 nongliba.cc
+googlevideo.com
