@@ -41,7 +41,7 @@ done
 shift $((OPTIND - 1))
 
 # 配置文件不存在时提示 init（init 命令本身不需要 config.json）
-if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]; then
+if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ]; then
     if [ -f "$DIR/config.template.json" ]; then
         echo "Error: $(basename "$BASE_CONFIG") 不存在"
         echo "运行 'sb init' 从模板生成配置"
@@ -53,7 +53,7 @@ if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]
 fi
 
 # init/import 不需要读取配置和端口信息
-if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]; then
+if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ]; then
     # 从配置文件读取 mixed 入站端口（唯一配置源）
     PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG")
     # 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
@@ -682,10 +682,92 @@ print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
         fi
         exit 0
         ;;
+    export)
+        profile="${2:-}"
+        if [ -n "$profile" ]; then
+            base="$DIR/config-${profile}.json"
+            out="$DIR/export-${profile}.json"
+        else
+            base="$BASE_CONFIG"
+            out="$DIR/export.json"
+        fi
+        if [ ! -f "$base" ]; then
+            echo "Error: $(basename "$base") 不存在"
+            exit 1
+        fi
+        python3 -c "
+import json, os
+
+with open('$base') as f:
+    config = json.load(f)
+
+# 移除 mixed 入站（iPhone 不需要）
+config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'mixed']
+
+# 移除 tun 的 route_exclude_address（SFI 不需要防环路）
+for ib in config['inbounds']:
+    if ib['type'] == 'tun':
+        ib.pop('route_exclude_address', None)
+
+# 注入域名路由规则
+def read_domains(filename):
+    filepath = os.path.join('$DIR', filename)
+    if not os.path.isfile(filepath):
+        return []
+    with open(filepath) as f:
+        return [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+
+proxy_domains = read_domains('proxy-domains.txt')
+direct_domains = read_domains('direct-domains.txt')
+rules = config.get('route', {}).get('rules', [])
+if proxy_domains:
+    idx = next((i for i, r in enumerate(rules) if 'geoip-cn' in r.get('rule_set', [])), len(rules))
+    rules.insert(idx, {'outbound': 'proxy', 'domain_suffix': proxy_domains})
+if direct_domains:
+    idx = next((i for i, r in enumerate(rules) if 'geosite-cn' in r.get('rule_set', [])), len(rules) - 1)
+    rules.insert(idx + 1, {'outbound': 'direct', 'domain_suffix': direct_domains})
+
+# 移除 1.12+ 字段（SFI 1.11 不支持）
+config.get('route', {}).pop('default_domain_resolver', None)
+
+# DNS servers: 新版格式(1.12+) → 旧版格式（SFI 兼容）
+# type+server → address (如 type:tcp + server:8.8.8.8 → address:tcp://8.8.8.8)
+for s in config.get('dns', {}).get('servers', []):
+    srv_type = s.pop('type', 'udp')
+    server = s.pop('server', '')
+    s['address'] = server if srv_type == 'udp' else f'{srv_type}://{server}'
+
+# DNS rules: action:reject → server:block
+dns_rules = config.get('dns', {}).get('rules', [])
+need_block = False
+for r in dns_rules:
+    if r.get('action') == 'reject':
+        r.pop('action')
+        r['server'] = 'block'
+        need_block = True
+if need_block:
+    config['dns']['servers'].append({'tag': 'block', 'address': 'rcode://success'})
+
+# rule_set: local → remote（iPhone 没有本地 .srs 文件）
+GEOSITE_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set'
+GEOIP_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set'
+for rs in config.get('route', {}).get('rule_set', []):
+    if rs.get('type') == 'local':
+        tag = rs['tag']
+        rs['type'] = 'remote'
+        rs['url'] = (GEOIP_BASE if tag.startswith('geoip') else GEOSITE_BASE) + '/' + tag + '.srs'
+        rs.pop('path', None)
+
+with open('$out', 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+"
+        echo "iPhone 配置已生成: $(basename "$out")"
+        exit 0
+        ;;
     mixed|tun|claude)
         ;;
     *)
-        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update]"
+        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export]"
         echo ""
         echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
         echo "  import [name]  从 VPS 提取 s-ui 凭据到 .env[.name]"
@@ -693,6 +775,7 @@ print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
         echo "  mixed  (默认) 绕过大陆IP，系统代理 127.0.0.1:$PROXY_PORT"
         echo "  tun            绕过大陆IP，TUN 全局接管（需要 root）"
         echo "  claude         仅 Claude 域名走代理，其余直连（公司网络用）"
+        echo "  export [name]  生成 iPhone sing-box 配置（如 sb export dmit）"
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"

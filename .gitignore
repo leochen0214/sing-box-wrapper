@@ -11,6 +11,10 @@ config.*.json
 !config.template.json
 !config.*.template.json
 
+# iPhone 导出配置（由 sb export 生成）
+export.json
+export-*.json
+
 # 运行时文件
 .config-run.json
 .sing-box.pid
