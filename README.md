@@ -17,9 +17,13 @@
 ├── .env.vps                     # 旧 VPS 凭据（.gitignore）
 ├── config.json                  # 由 sb init 生成（.gitignore）
 │
-├── proxy-domains.txt            # claude 模式代理域名列表（入库）
+├── proxy-domains.txt            # 强制代理域名（mixed/tun/claude 共用，入库）
+├── direct-domains.txt           # 强制直连域名（入库）
 ├── corp-bypass-domains.txt      # 代理绕过域名（.gitignore，本地特定）
 ├── cdn-ips.txt                  # CDN 优选 IP 缓存（.gitignore）
+│
+├── export.json                  # iPhone 配置（sb export 生成，.gitignore）
+├── sub.json                     # 订阅节点（sb sub 生成，.gitignore）
 │
 ├── .config-run.json             # 运行时配置（sb 自动生成）
 ├── .sing-box.pid                # PID 文件（sb 自动管理）
@@ -81,6 +85,14 @@ sb status
 sb cdn ip                     # 测试优选 Cloudflare IP
 sb cdn on && sb               # 开启 CDN 模式
 sb cdn off && sb              # 恢复直连
+
+# iPhone sing-box (SFI)
+sb export dmit                # 生成 iPhone 配置（自有 VPS 节点）
+sb serve dmit                 # 导出并起临时 HTTP 服务，iPhone 拉取 Remote Profile
+sb export --sub <订阅URL>     # 生成 iPhone 配置（机场订阅节点）
+
+# 订阅转换
+sb sub <订阅URL>              # Clash/V2Ray/SS 订阅 → sing-box 格式（输出到 sub.json）
 
 # 其他
 sb log info                   # 切换日志级别（运行中自动重启）
@@ -218,6 +230,45 @@ echo "gsuus.com" >> direct-domains.txt
 sb mixed   # 或 sb tun
 ```
 
+## iPhone sing-box (SFI)
+
+### 导出配置
+
+```bash
+sb export dmit                # 自有 VPS 节点 → export-dmit.json
+sb export --sub <订阅URL>     # 机场订阅节点 → export.json
+```
+
+导出会自动处理 SFI 兼容性：
+- 移除 mixed 入站和 tun 防环路配置
+- DNS/路由格式降级为 1.11 兼容（`type`+`server` → `address`）
+- 规则集从本地文件改为远程 URL
+- `urltest` 改为 `selector`（支持手动切换节点）
+- 注入 `proxy-domains.txt` / `direct-domains.txt` 域名规则
+
+### 传输到 iPhone
+
+**方式一：临时 HTTP 服务（推荐）**
+```bash
+sb serve dmit                 # 起临时服务并显示 URL
+# iPhone SFI: Profiles → New Profile → Remote → 粘贴 URL → 保存
+# 拉取完成后 Ctrl+C 关闭
+```
+
+**方式二：AirDrop**
+- Finder 中 AirDrop `export-dmit.json` 到 iPhone，选择用 sing-box 打开
+
+### 订阅转换
+
+支持 Clash YAML、V2Ray/SS base64 订阅格式，自动识别并转换为 sing-box outbound：
+
+```bash
+sb sub <订阅URL>              # 转换并输出到 sub.json
+sb export --sub <订阅URL>     # 转换并生成可用的 iPhone 配置
+```
+
+支持的协议：`ss://`、`vmess://`、`vless://`、`trojan://`
+
 ### Tun 模式 route_exclude_address
 
 tun 入站中 `route_exclude_address` 包含 VPS IP，是 tun 模式正常工作的前提。
@@ -248,6 +299,14 @@ sb stop                         # 停止
 sb status                       # 查看状态
 sb log [level]                  # 日志级别（info/warn/error/debug）
 sb cdn [on|off|ip|list|set]     # CDN 中继管理
+sb export [name]                # 生成 iPhone sing-box 配置
+sb export [name] --sub <url>    # 生成 iPhone 配置（使用机场订阅节点）
+sb serve [name]                 # 导出并起临时 HTTP 服务供 iPhone 拉取
+sb sub <url>                    # 订阅转换（Clash/V2Ray/SS → sing-box）
+sb export [name]                # 生成 iPhone sing-box 配置
+sb export [name] --sub <url>    # 生成 iPhone 配置（使用机场订阅节点）
+sb serve [name]                 # 导出并起临时 HTTP 服务供 iPhone 拉取
+sb sub <url>                    # 订阅转换（Clash/V2Ray/SS → sing-box）
 sb check [IP]                   # 检测 VPS IP 是否被封
 sb update                       # 更新 geosite/geoip 规则集
 sb -c file.json mixed           # 指定配置文件
