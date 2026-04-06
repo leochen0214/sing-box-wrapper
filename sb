@@ -709,6 +709,18 @@ for ib in config['inbounds']:
     if ib['type'] == 'tun':
         ib.pop('route_exclude_address', None)
 
+# urltest → selector（允许手动切换代理节点），并加入 proxy-cdn
+for ob in config['outbounds']:
+    if ob.get('type') == 'urltest':
+        ob['type'] = 'selector'
+        # 把 urltest 专有字段移除
+        for key in ['url', 'interval', 'tolerance', 'interrupt_exist_connections']:
+            ob.pop(key, None)
+        # 加入 proxy-cdn（如果存在）
+        if any(o.get('tag') == 'proxy-cdn' for o in config['outbounds']):
+            if 'proxy-cdn' not in ob.get('outbounds', []):
+                ob['outbounds'].append('proxy-cdn')
+
 # 注入域名路由规则
 def read_domains(filename):
     filepath = os.path.join('$DIR', filename)
