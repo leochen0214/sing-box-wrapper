@@ -41,7 +41,7 @@ done
 shift $((OPTIND - 1))
 
 # 配置文件不存在时提示 init（init 命令本身不需要 config.json）
-if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ]; then
+if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ] && [ "${1:-}" != "sub" ]; then
     if [ -f "$DIR/config.template.json" ]; then
         echo "Error: $(basename "$BASE_CONFIG") 不存在"
         echo "运行 'sb init' 从模板生成配置"
@@ -53,7 +53,7 @@ if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]
 fi
 
 # init/import 不需要读取配置和端口信息
-if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ]; then
+if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ] && [ "${1:-}" != "sub" ]; then
     # 从配置文件读取 mixed 入站端口（唯一配置源）
     PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG")
     # 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
@@ -683,7 +683,15 @@ print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
         exit 0
         ;;
     export)
-        profile="${2:-}"
+        profile=""
+        sub_url=""
+        shift  # 跳过 "export"
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --sub) sub_url="${2:-}"; shift 2 ;;
+                *) profile="$1"; shift ;;
+            esac
+        done
         if [ -n "$profile" ]; then
             base="$DIR/config-${profile}.json"
             out="$DIR/export-${profile}.json"
@@ -694,6 +702,10 @@ print(sum(len(v) for r in rules for k,v in r.items() if isinstance(v, list)))
         if [ ! -f "$base" ]; then
             echo "Error: $(basename "$base") 不存在"
             exit 1
+        fi
+        # 如果指定了订阅 URL，先执行 sb sub 获取节点
+        if [ -n "$sub_url" ]; then
+            "$0" sub "$sub_url"
         fi
         python3 -c "
 import json, os
@@ -720,6 +732,23 @@ for ob in config['outbounds']:
         if any(o.get('tag') == 'proxy-cdn' for o in config['outbounds']):
             if 'proxy-cdn' not in ob.get('outbounds', []):
                 ob['outbounds'].append('proxy-cdn')
+
+# 合并订阅节点（仅在 --sub 时）
+sub_file = os.path.join('$DIR', 'sub.json')
+if '$sub_url' and os.path.isfile(sub_file):
+    with open(sub_file) as f:
+        sub_nodes = json.load(f)
+    if sub_nodes:
+        sub_tags = [n['tag'] for n in sub_nodes]
+        # 只保留 selector、direct 和订阅节点，移除自有 VPS 节点
+        config['outbounds'] = [
+            ob for ob in config['outbounds']
+            if ob.get('type') in ('selector', 'direct') or ob.get('tag') in sub_tags
+        ] + [n for n in sub_nodes if n['tag'] not in {ob.get('tag') for ob in config['outbounds']}]
+        # selector 只包含订阅节点
+        for ob in config['outbounds']:
+            if ob.get('type') == 'selector':
+                ob['outbounds'] = sub_tags
 
 # 注入域名路由规则
 def read_domains(filename):
@@ -815,10 +844,271 @@ http.createServer((req, res) => {
 }).listen(${port}, '0.0.0.0', () => console.log('服务已启动'));"
         exit 0
         ;;
+    sub)
+        sub_url="${2:-}"
+        if [ -z "$sub_url" ]; then
+            echo "用法: sb sub <订阅URL>"
+            exit 1
+        fi
+        # 通过本地代理获取订阅（如果 sing-box 运行中）
+        CURL_PROXY=""
+        if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+            _proxy_port=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG" 2>/dev/null)
+            [ -n "$_proxy_port" ] && CURL_PROXY="-x http://127.0.0.1:$_proxy_port"
+        fi
+        python3 - "$sub_url" "$CURL_PROXY" "$DIR" << 'SUB_EOF'
+import sys, json, base64, urllib.request, urllib.parse, os, re
+
+sub_url = sys.argv[1]
+curl_proxy = sys.argv[2]
+dir_path = sys.argv[3]
+
+# 获取订阅内容
+if curl_proxy:
+    proxy_host = curl_proxy.split('/')[-1]
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({'http': f'http://{proxy_host}', 'https': f'http://{proxy_host}'}))
+else:
+    opener = urllib.request.build_opener()
+opener.addheaders = [('User-Agent', 'sing-box')]
+raw = opener.open(sub_url, timeout=15).read()
+
+# ── 解析 URI ──
+def parse_ss(uri):
+    """ss://base64(method:password)@host:port#name 或 SIP002"""
+    uri = uri[5:]  # 去掉 ss://
+    tag = ''
+    if '#' in uri:
+        uri, tag = uri.rsplit('#', 1)
+        tag = urllib.parse.unquote(tag)
+    # SIP002: base64@host:port
+    if '@' in uri:
+        userinfo, hostport = uri.rsplit('@', 1)
+        try:
+            userinfo = base64.b64decode(userinfo + '==').decode()
+        except Exception:
+            pass
+        method, password = userinfo.split(':', 1)
+        host, port = hostport.rsplit(':', 1)
+    else:
+        # Legacy: base64(method:password@host:port)
+        decoded = base64.b64decode(uri + '==').decode()
+        userinfo, hostport = decoded.rsplit('@', 1)
+        method, password = userinfo.split(':', 1)
+        host, port = hostport.rsplit(':', 1)
+    return {'type': 'shadowsocks', 'tag': tag or f'ss-{host}',
+            'server': host, 'server_port': int(port),
+            'method': method, 'password': password}
+
+def parse_vmess(uri):
+    """vmess://base64(json)"""
+    data = json.loads(base64.b64decode(uri[8:] + '==').decode())
+    ob = {'type': 'vmess', 'tag': data.get('ps', f"vmess-{data['add']}"),
+          'server': data['add'], 'server_port': int(data['port']),
+          'uuid': data['id'], 'security': data.get('scy', 'auto'),
+          'alter_id': int(data.get('aid', 0))}
+    # TLS
+    if data.get('tls') == 'tls':
+        ob['tls'] = {'enabled': True, 'server_name': data.get('sni', data.get('host', ''))}
+    # Transport
+    net = data.get('net', 'tcp')
+    if net == 'ws':
+        ob['transport'] = {'type': 'ws', 'path': data.get('path', '/'),
+                           'headers': {'Host': data.get('host', '')}}
+    elif net == 'grpc':
+        ob['transport'] = {'type': 'grpc', 'service_name': data.get('path', '')}
+    elif net == 'h2':
+        ob['transport'] = {'type': 'http', 'host': [data.get('host', '')],
+                           'path': data.get('path', '/')}
+    return ob
+
+def parse_vless(uri):
+    """vless://uuid@host:port?params#name"""
+    parsed = urllib.parse.urlparse(uri)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    tag = urllib.parse.unquote(parsed.fragment) or f'vless-{parsed.hostname}'
+    ob = {'type': 'vless', 'tag': tag,
+          'server': parsed.hostname, 'server_port': int(parsed.port),
+          'uuid': parsed.username}
+    if params.get('flow'):
+        ob['flow'] = params['flow']
+    # TLS / Reality
+    security = params.get('security', '')
+    if security in ('tls', 'reality'):
+        tls = {'enabled': True, 'server_name': params.get('sni', parsed.hostname)}
+        if params.get('fp'):
+            tls['utls'] = {'enabled': True, 'fingerprint': params['fp']}
+        if security == 'reality':
+            tls['reality'] = {'enabled': True,
+                              'public_key': params.get('pbk', ''),
+                              'short_id': params.get('sid', '')}
+        ob['tls'] = tls
+    # Transport
+    net = params.get('type', 'tcp')
+    if net == 'ws':
+        ob['transport'] = {'type': 'ws', 'path': params.get('path', '/'),
+                           'headers': {'Host': params.get('host', parsed.hostname)}}
+    elif net == 'grpc':
+        ob['transport'] = {'type': 'grpc', 'service_name': params.get('serviceName', '')}
+    return ob
+
+def parse_trojan(uri):
+    """trojan://password@host:port?params#name"""
+    parsed = urllib.parse.urlparse(uri)
+    params = dict(urllib.parse.parse_qsl(parsed.query))
+    tag = urllib.parse.unquote(parsed.fragment) or f'trojan-{parsed.hostname}'
+    ob = {'type': 'trojan', 'tag': tag,
+          'server': parsed.hostname, 'server_port': int(parsed.port),
+          'password': urllib.parse.unquote(parsed.username)}
+    tls = {'enabled': True, 'server_name': params.get('sni', parsed.hostname)}
+    if params.get('fp'):
+        tls['utls'] = {'enabled': True, 'fingerprint': params['fp']}
+    ob['tls'] = tls
+    # Transport
+    net = params.get('type', 'tcp')
+    if net == 'ws':
+        ob['transport'] = {'type': 'ws', 'path': params.get('path', '/'),
+                           'headers': {'Host': params.get('host', parsed.hostname)}}
+    elif net == 'grpc':
+        ob['transport'] = {'type': 'grpc', 'service_name': params.get('serviceName', '')}
+    return ob
+
+def parse_clash_proxy(p):
+    """Clash YAML proxy → sing-box outbound"""
+    ptype = p.get('type', '')
+    base = {'tag': p.get('name', ''), 'server': p.get('server', ''),
+            'server_port': int(p.get('port', 0))}
+    if ptype == 'ss':
+        return {**base, 'type': 'shadowsocks',
+                'method': p.get('cipher', ''), 'password': str(p.get('password', ''))}
+    elif ptype == 'vmess':
+        ob = {**base, 'type': 'vmess', 'uuid': p.get('uuid', ''),
+              'security': p.get('cipher', 'auto'), 'alter_id': int(p.get('alterId', 0))}
+        if p.get('tls'):
+            ob['tls'] = {'enabled': True, 'server_name': p.get('servername', p.get('sni', ''))}
+        net = p.get('network', 'tcp')
+        if net == 'ws':
+            ws_opts = p.get('ws-opts', {})
+            ob['transport'] = {'type': 'ws', 'path': ws_opts.get('path', '/'),
+                               'headers': ws_opts.get('headers', {})}
+        elif net == 'grpc':
+            grpc_opts = p.get('grpc-opts', {})
+            ob['transport'] = {'type': 'grpc', 'service_name': grpc_opts.get('grpc-service-name', '')}
+        return ob
+    elif ptype == 'vless':
+        ob = {**base, 'type': 'vless', 'uuid': p.get('uuid', '')}
+        if p.get('flow'):
+            ob['flow'] = p['flow']
+        if p.get('tls'):
+            tls = {'enabled': True, 'server_name': p.get('servername', p.get('sni', ''))}
+            if p.get('client-fingerprint'):
+                tls['utls'] = {'enabled': True, 'fingerprint': p['client-fingerprint']}
+            reality_opts = p.get('reality-opts', {})
+            if reality_opts:
+                tls['reality'] = {'enabled': True,
+                                  'public_key': reality_opts.get('public-key', ''),
+                                  'short_id': reality_opts.get('short-id', '')}
+            ob['tls'] = tls
+        net = p.get('network', 'tcp')
+        if net == 'ws':
+            ws_opts = p.get('ws-opts', {})
+            ob['transport'] = {'type': 'ws', 'path': ws_opts.get('path', '/'),
+                               'headers': ws_opts.get('headers', {})}
+        elif net == 'grpc':
+            grpc_opts = p.get('grpc-opts', {})
+            ob['transport'] = {'type': 'grpc', 'service_name': grpc_opts.get('grpc-service-name', '')}
+        return ob
+    elif ptype == 'trojan':
+        ob = {**base, 'type': 'trojan', 'password': str(p.get('password', ''))}
+        tls = {'enabled': True, 'server_name': p.get('sni', p.get('server', ''))}
+        if p.get('client-fingerprint'):
+            tls['utls'] = {'enabled': True, 'fingerprint': p['client-fingerprint']}
+        ob['tls'] = tls
+        net = p.get('network', 'tcp')
+        if net == 'ws':
+            ws_opts = p.get('ws-opts', {})
+            ob['transport'] = {'type': 'ws', 'path': ws_opts.get('path', '/'),
+                               'headers': ws_opts.get('headers', {})}
+        return ob
+    return None
+
+# ── 检测格式并解析 ──
+outbounds = []
+text = raw.decode('utf-8', errors='ignore')
+
+# 尝试 Clash YAML
+if 'proxies:' in text:
+    import yaml
+    data = yaml.safe_load(text)
+    proxies = data.get('proxies', [])
+    for p in proxies:
+        try:
+            ob = parse_clash_proxy(p)
+            if ob:
+                outbounds.append(ob)
+        except Exception as e:
+            print(f'  跳过 {p.get("name","?")}: {e}', file=sys.stderr)
+else:
+    # 尝试 base64 解码 (V2Ray/SS 订阅)
+    try:
+        decoded = base64.b64decode(raw + b'==').decode('utf-8', errors='ignore')
+        lines = [l.strip() for l in decoded.splitlines() if l.strip()]
+    except Exception:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    for line in lines:
+        try:
+            if line.startswith('ss://'):
+                outbounds.append(parse_ss(line))
+            elif line.startswith('vmess://'):
+                outbounds.append(parse_vmess(line))
+            elif line.startswith('vless://'):
+                outbounds.append(parse_vless(line))
+            elif line.startswith('trojan://'):
+                outbounds.append(parse_trojan(line))
+        except Exception as e:
+            print(f'  跳过: {line[:30]}... ({e})', file=sys.stderr)
+
+# 过滤伪节点（端口为 0、server 含非 ASCII、tag 不含地域/节点信息的纯中文提示）
+def is_fake(ob):
+    if ob.get('server_port', 0) <= 0:
+        return True
+    if not ob.get('server', '').isascii():
+        return True
+    tag = ob.get('tag', '')
+    # tag 全是中文且不含常见地域关键词 → 大概率是提示信息
+    if tag and not any(c.isascii() and c.isalpha() for c in tag):
+        return True
+    return False
+outbounds = [ob for ob in outbounds if not is_fake(ob)]
+
+if not outbounds:
+    print('Error: 未解析到任何节点', file=sys.stderr)
+    sys.exit(1)
+
+# 输出
+out_file = os.path.join(dir_path, 'sub.json')
+with open(out_file, 'w') as f:
+    json.dump(outbounds, f, indent=2, ensure_ascii=False)
+
+# 打印摘要
+print(f'转换完成: {len(outbounds)} 个节点 → sub.json')
+print('')
+types = {}
+for ob in outbounds:
+    t = ob['type']
+    types[t] = types.get(t, 0) + 1
+print('协议统计:', ', '.join(f'{t}:{n}' for t, n in types.items()))
+print('')
+for i, ob in enumerate(outbounds):
+    print(f'  {i+1:2d}. [{ob["type"]:12s}] {ob["tag"]}')
+SUB_EOF
+        exit 0
+        ;;
     mixed|tun|claude)
         ;;
     *)
-        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export|serve]"
+        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export|serve|sub]"
         echo ""
         echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
         echo "  import [name]  从 VPS 提取 s-ui 凭据到 .env[.name]"
@@ -828,6 +1118,7 @@ http.createServer((req, res) => {
         echo "  claude         仅 Claude 域名走代理，其余直连（公司网络用）"
         echo "  export [name]  生成 iPhone sing-box 配置（如 sb export dmit）"
         echo "  serve [name]   导出并起临时 HTTP 服务供 iPhone 拉取"
+        echo "  sub <url>      订阅转换（Clash/V2Ray/SS → sing-box）"
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"

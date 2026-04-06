@@ -14,6 +14,7 @@ config.*.json
 # iPhone 导出配置（由 sb export 生成）
 export.json
 export-*.json
+sub.json
 
 # 运行时文件
 .config-run.json
