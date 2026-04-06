@@ -41,7 +41,7 @@ done
 shift $((OPTIND - 1))
 
 # 配置文件不存在时提示 init（init 命令本身不需要 config.json）
-if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ]; then
+if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ]; then
     if [ -f "$DIR/config.template.json" ]; then
         echo "Error: $(basename "$BASE_CONFIG") 不存在"
         echo "运行 'sb init' 从模板生成配置"
@@ -53,7 +53,7 @@ if [ ! -f "$BASE_CONFIG" ] && [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ]
 fi
 
 # init/import 不需要读取配置和端口信息
-if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ]; then
+if [ "${1:-}" != "init" ] && [ "${1:-}" != "import" ] && [ "${1:-}" != "export" ] && [ "${1:-}" != "serve" ]; then
     # 从配置文件读取 mixed 入站端口（唯一配置源）
     PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG")
     # 检测默认网络接口（比 sing-box auto_detect_interface 更可靠）
@@ -776,10 +776,49 @@ with open('$out', 'w') as f:
         echo "iPhone 配置已生成: $(basename "$out")"
         exit 0
         ;;
+    serve)
+        profile="${2:-}"
+        "$0" export $profile
+        if [ -n "$profile" ]; then
+            export_file="export-${profile}.json"
+        else
+            export_file="export.json"
+        fi
+        local_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+        port=9000
+        # 端口被占用时自动递增
+        while lsof -i :"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+            port=$((port + 1))
+        done
+        echo ""
+        echo "iPhone 配置地址:"
+        echo "  http://${local_ip}:${port}/${export_file}"
+        echo ""
+        echo "在 SFI 中: Profiles → New Profile → Type: Remote → 粘贴上面的 URL"
+        echo "拉取完成后按 Ctrl+C 关闭"
+        echo ""
+        node -e "
+const http = require('http');
+const fs = require('fs');
+const file = '$DIR/${export_file}';
+http.createServer((req, res) => {
+  if (req.url === '/${export_file}') {
+    const data = fs.readFileSync(file);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': data.length
+    });
+    res.end(data);
+  } else {
+    res.writeHead(404); res.end('Not Found');
+  }
+}).listen(${port}, '0.0.0.0', () => console.log('服务已启动'));"
+        exit 0
+        ;;
     mixed|tun|claude)
         ;;
     *)
-        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export]"
+        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export|serve]"
         echo ""
         echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
         echo "  import [name]  从 VPS 提取 s-ui 凭据到 .env[.name]"
@@ -788,6 +827,7 @@ with open('$out', 'w') as f:
         echo "  tun            绕过大陆IP，TUN 全局接管（需要 root）"
         echo "  claude         仅 Claude 域名走代理，其余直连（公司网络用）"
         echo "  export [name]  生成 iPhone sing-box 配置（如 sb export dmit）"
+        echo "  serve [name]   导出并起临时 HTTP 服务供 iPhone 拉取"
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
