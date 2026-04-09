@@ -92,7 +92,10 @@ sb serve dmit                 # 导出并起临时 HTTP 服务，iPhone 拉取 R
 sb export --sub <订阅URL>     # 生成 iPhone 配置（机场订阅节点）
 
 # 订阅转换
-sb sub <订阅URL>              # Clash/V2Ray/SS 订阅 → sing-box 格式（输出到 sub.json）
+sb sub <订阅URL>                     # 只输出节点到 sub.json
+sb sub <订阅URL> cloudflare          # 生成完整可运行的 config-cloudflare.json
+sb -c config-cloudflare.json select  # 查看/切换节点
+sb -c config-cloudflare.json mixed   # 用订阅配置运行
 
 # 其他
 sb log info                   # 切换日志级别（运行中自动重启）
@@ -265,16 +268,49 @@ sb serve dmit                 # 起临时服务并显示 URL
 **方式二：AirDrop**
 - Finder 中 AirDrop `export-dmit.json` 到 iPhone，选择用 sing-box 打开
 
-### 订阅转换
+## 订阅转换
 
-支持 Clash YAML、V2Ray/SS base64 订阅格式，自动识别并转换为 sing-box outbound：
+支持三种订阅格式（自动识别）：
+- **Clash YAML** — `proxies:` 开头
+- **V2Ray/SS base64** — `ss://`/`vmess://`/`vless://`/`trojan://` URI 列表
+- **sing-box JSON** — 机场根据 User-Agent 返回的完整配置
 
 ```bash
-sb sub <订阅URL>              # 转换并输出到 sub.json
-sb export --sub <订阅URL>     # 转换并生成可用的 iPhone 配置
+# 仅转换节点（输出到 sub.json）
+sb sub <订阅URL>
+
+# 生成完整可运行的配置（用于 Mac）
+sb sub <订阅URL> cloudflare
+# → sub.json + config-cloudflare.json
+
+# 运行
+sb -c config-cloudflare.json mixed      # 系统代理模式
+sb -c config-cloudflare.json tun        # TUN 全局模式
+
+# 生成 iPhone 配置
+sb export --sub <订阅URL>                # → export.json
 ```
 
-支持的协议：`ss://`、`vmess://`、`vless://`、`trojan://`
+`sb sub <url> <name>` 生成的配置特点：
+- `proxy` 是 `selector` 类型，默认第一个节点，支持手动切换
+- 所有节点 IP 自动填入 tun `route_exclude_address`，防止路由环路
+- 保留 `config.template.json` 的 DNS/路由规则和域名分流
+
+### 切换节点
+
+```bash
+# 列出所有节点（* 标记当前节点）
+sb -c config-cloudflare.json select
+
+# 按 tag 切换
+sb -c config-cloudflare.json select "JP"
+
+# 按序号切换
+sb -c config-cloudflare.json select 12
+
+# 切换后需要重启生效
+sb stop && sb -c config-cloudflare.json mixed
+```
 
 ### Tun 模式 route_exclude_address
 
@@ -308,12 +344,9 @@ sb log [level]                  # 日志级别（info/warn/error/debug）
 sb cdn [on|off|ip|list|set]     # CDN 中继管理
 sb export [name]                # 生成 iPhone sing-box 配置
 sb export [name] --sub <url>    # 生成 iPhone 配置（使用机场订阅节点）
-sb serve [name]                 # 导出并起临时 HTTP 服务供 iPhone 拉取
-sb sub <url>                    # 订阅转换（Clash/V2Ray/SS → sing-box）
-sb export [name]                # 生成 iPhone sing-box 配置
-sb export [name] --sub <url>    # 生成 iPhone 配置（使用机场订阅节点）
-sb serve [name]                 # 导出并起临时 HTTP 服务供 iPhone 拉取
-sb sub <url>                    # 订阅转换（Clash/V2Ray/SS → sing-box）
+sb serve [name]                 # 起临时 HTTP 服务供 iPhone 拉取
+sb sub <url> [name]             # 订阅转换（有 name 则生成 config-<name>.json）
+sb select [tag|idx]             # 列出/切换 selector 节点（配合 -c 使用）
 sb check [IP]                   # 检测 VPS IP 是否被封
 sb update                       # 更新 geosite/geoip 规则集
 sb -c file.json mixed           # 指定配置文件
