@@ -807,11 +807,14 @@ with open('$out', 'w') as f:
         ;;
     serve)
         profile="${2:-}"
-        "$0" export $profile
         if [ -n "$profile" ]; then
             export_file="export-${profile}.json"
         else
             export_file="export.json"
+        fi
+        if [ ! -f "$DIR/$export_file" ]; then
+            echo "Error: $export_file 不存在，请先运行 sb export"
+            exit 1
         fi
         local_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
         port=9000
@@ -1034,10 +1037,22 @@ def parse_clash_proxy(p):
 
 # ── 检测格式并解析 ──
 outbounds = []
-text = raw.decode('utf-8', errors='ignore')
+text = raw.decode('utf-8', errors='ignore').lstrip()
 
+# 尝试 sing-box JSON 配置（机场根据 UA 返回的完整配置）
+if text.startswith('{'):
+    try:
+        data = json.loads(text)
+        sb_obs = data.get('outbounds', [])
+        # 过滤掉 direct/block/dns/selector/urltest，只保留真实节点
+        skip_types = {'direct', 'block', 'dns', 'selector', 'urltest'}
+        for ob in sb_obs:
+            if ob.get('type') not in skip_types:
+                outbounds.append(ob)
+    except Exception as e:
+        print(f'  sing-box JSON 解析失败: {e}', file=sys.stderr)
 # 尝试 Clash YAML
-if 'proxies:' in text:
+elif 'proxies:' in text:
     import yaml
     data = yaml.safe_load(text)
     proxies = data.get('proxies', [])
@@ -1069,14 +1084,22 @@ else:
         except Exception as e:
             print(f'  跳过: {line[:30]}... ({e})', file=sys.stderr)
 
-# 过滤伪节点（端口为 0、server 含非 ASCII、tag 不含地域/节点信息的纯中文提示）
+# 过滤伪节点
 def is_fake(ob):
+    server = ob.get('server', '')
     if ob.get('server_port', 0) <= 0:
         return True
-    if not ob.get('server', '').isascii():
+    if not server.isascii():
+        return True
+    # 本地/回环地址
+    if server in ('127.0.0.1', 'localhost', '0.0.0.0'):
+        return True
+    # 推广用的超长 DNS 标签（含 telegram/channel/join 等关键词）
+    server_lower = server.lower()
+    if any(kw in server_lower for kw in ['telegram', 'channel', 'join.my', 'unlock', 't.me']):
         return True
     tag = ob.get('tag', '')
-    # tag 全是中文且不含常见地域关键词 → 大概率是提示信息
+    # tag 全是中文且不含拉丁字母 → 大概率是提示信息
     if tag and not any(c.isascii() and c.isalpha() for c in tag):
         return True
     return False

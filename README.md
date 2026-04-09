@@ -250,10 +250,17 @@ sb export --sub <订阅URL>     # 机场订阅节点 → export.json
 
 **方式一：临时 HTTP 服务（推荐）**
 ```bash
+sb export dmit                # 先生成 export-dmit.json
 sb serve dmit                 # 起临时服务并显示 URL
 # iPhone SFI: Profiles → New Profile → Remote → 粘贴 URL → 保存
 # 拉取完成后 Ctrl+C 关闭
 ```
+
+> **推荐用 iPhone 开热点，Mac 连上后再 `sb serve`。**
+>
+> 原因：很多 WiFi（尤其公司/酒店/部分家用路由器）开启了 AP Isolation（客户端隔离），Mac 和 iPhone 虽然同网段但无法互通，ARP 表会看到 iPhone 是 `(incomplete)`。iPhone 热点不会做隔离，最省事。
+>
+> 拉取前记得先关闭 iPhone 上 sing-box 的 Enabled 开关，否则 tun 会拦截局域网访问。
 
 **方式二：AirDrop**
 - Finder 中 AirDrop `export-dmit.json` 到 iPhone，选择用 sing-box 打开
