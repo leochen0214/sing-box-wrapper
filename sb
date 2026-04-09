@@ -1173,39 +1173,73 @@ import sys, json
 cfg_file, target = sys.argv[1], sys.argv[2]
 with open(cfg_file) as f:
     config = json.load(f)
-selector = next((ob for ob in config.get('outbounds', [])
-                 if ob.get('type') == 'selector' and ob.get('tag') == 'proxy'), None)
-if not selector:
-    print('Error: 配置中没有 selector 类型的 proxy outbound', file=sys.stderr)
-    print('(提示: sb select 只适用于由 sb sub <url> <name> 生成的配置)', file=sys.stderr)
+proxy = next((ob for ob in config.get('outbounds', [])
+              if ob.get('tag') == 'proxy' and ob.get('type') in ('selector', 'urltest')), None)
+if not proxy:
+    print('Error: 配置中没有 selector/urltest 类型的 proxy outbound', file=sys.stderr)
     sys.exit(1)
 
+cur_type = proxy['type']
 if not target:
     # 列出所有节点
-    current = selector.get('default', '(未设置)')
+    if cur_type == 'urltest':
+        current = '(auto - urltest 自动选最快)'
+    else:
+        current = proxy.get('default', '(未设置)')
+    print(f'当前模式: {cur_type}')
     print(f'当前节点: {current}\n')
-    print(f'可选节点 ({len(selector["outbounds"])}):')
-    for i, tag in enumerate(selector['outbounds']):
-        mark = ' *' if tag == current else '  '
+    print(f'可选节点 ({len(proxy["outbounds"])}):')
+    for i, tag in enumerate(proxy['outbounds']):
+        mark = ' *' if cur_type == 'selector' and tag == current else '  '
         print(f'{mark}{i+1:3d}. {tag}')
+    print('\n  sb select auto         # 切换到自动选最快 (urltest)')
+    print('  sb select <tag|序号>   # 手动选择节点')
     sys.exit(0)
 
-# 切换节点：支持序号或 tag
+# auto → urltest
+if target == 'auto':
+    if cur_type == 'urltest':
+        print('已是 auto 模式，无需切换')
+        sys.exit(0)
+    # selector → urltest，移除 default，添加 urltest 字段
+    proxy['type'] = 'urltest'
+    proxy.pop('default', None)
+    proxy['url'] = 'https://www.gstatic.com/generate_204'
+    proxy['interval'] = '3m'
+    proxy['tolerance'] = 100
+    proxy['interrupt_exist_connections'] = True
+    with open(cfg_file, 'w') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print('已切换: selector → urltest (auto)')
+    print('重启生效: sb stop && sb mixed  (或 tun)')
+    sys.exit(0)
+
+# 手动选择节点：支持序号或 tag
 if target.isdigit():
     idx = int(target) - 1
-    if idx < 0 or idx >= len(selector['outbounds']):
-        print(f'Error: 序号 {target} 超出范围 (1-{len(selector["outbounds"])})', file=sys.stderr)
+    if idx < 0 or idx >= len(proxy['outbounds']):
+        print(f'Error: 序号 {target} 超出范围 (1-{len(proxy["outbounds"])})', file=sys.stderr)
         sys.exit(1)
-    target = selector['outbounds'][idx]
-elif target not in selector['outbounds']:
+    target = proxy['outbounds'][idx]
+elif target not in proxy['outbounds']:
     print(f'Error: 节点 "{target}" 不存在', file=sys.stderr)
     print('使用 sb select 查看可选节点', file=sys.stderr)
     sys.exit(1)
-old = selector.get('default', '(未设置)')
-selector['default'] = target
+
+# urltest → selector
+if cur_type == 'urltest':
+    proxy['type'] = 'selector'
+    for key in ['url', 'interval', 'tolerance', 'interrupt_exist_connections']:
+        proxy.pop(key, None)
+    print(f'已切换: urltest → selector, default={target}')
+else:
+    old = proxy.get('default', '(未设置)')
+    proxy['default'] = target
+    print(f'已切换: {old} → {target}')
+
+proxy['default'] = target
 with open(cfg_file, 'w') as f:
     json.dump(config, f, indent=2, ensure_ascii=False)
-print(f'已切换: {old} → {target}')
 print('重启生效: sb stop && sb mixed  (或 tun)')
 SELECT_EOF
         exit 0

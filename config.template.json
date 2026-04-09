@@ -59,16 +59,14 @@
   ],
   "outbounds": [
     {
-      "type": "urltest",
+      "type": "selector",
       "tag": "proxy",
       "outbounds": [
         "proxy-shadowtls",
-        "proxy-reality"
+        "proxy-reality",
+        "proxy-cdn"
       ],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "3m",
-      "tolerance": 100,
-      "interrupt_exist_connections": true
+      "default": "proxy-shadowtls"
     },
     {
       "type": "shadowsocks",

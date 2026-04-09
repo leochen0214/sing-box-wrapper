@@ -81,9 +81,14 @@ sb mixed                      # tun → mixed
 sb stop
 sb status
 
+# 切换节点（selector 手动 / urltest 自动）
+sb select                     # 列出所有节点
+sb select proxy-cdn           # 切到 CDN 节点
+sb select auto                # 切回自动选最快
+
 # CDN 中继（IP 被封时的备用线路）
 sb cdn ip                     # 测试优选 Cloudflare IP
-sb cdn on && sb               # 开启 CDN 模式
+sb cdn on && sb               # 开启 CDN 模式（等价于 sb select proxy-cdn）
 sb cdn off && sb              # 恢复直连
 
 # iPhone sing-box (SFI)
@@ -296,21 +301,37 @@ sb export --sub <订阅URL>                # → export.json
 - 所有节点 IP 自动填入 tun `route_exclude_address`，防止路由环路
 - 保留 `config.template.json` 的 DNS/路由规则和域名分流
 
-### 切换节点
+## 节点选择 (sb select)
+
+适用于**自有 VPS 配置**（`config.json` / `config-<profile>.json`）和**订阅配置**（`config-<name>.json`）。
 
 ```bash
-# 列出所有节点（* 标记当前节点）
+# 列出所有节点（显示当前模式 selector/urltest 和选中的节点）
+sb select
 sb -c config-cloudflare.json select
 
-# 按 tag 切换
+# 手动选择节点（selector 模式）
+sb select proxy-cdn                 # 按 tag
+sb select 3                         # 按序号
 sb -c config-cloudflare.json select "JP"
 
-# 按序号切换
-sb -c config-cloudflare.json select 12
+# 自动选最快（urltest 模式）
+sb select auto
 
 # 切换后需要重启生效
-sb stop && sb -c config-cloudflare.json mixed
+sb stop && sb
 ```
+
+**工作原理：**
+- `sb select <tag|idx>` → 配置里 `proxy` 变为 `selector` 类型，`default` 设为指定节点
+- `sb select auto` → 配置里 `proxy` 变为 `urltest` 类型，自动选延迟最低的节点
+
+**自有 VPS 配置的 proxy 列表：**
+- `proxy-shadowtls` — ShadowTLS v3 + Shadowsocks（默认）
+- `proxy-reality` — VLESS Reality
+- `proxy-cdn` — VLESS over Cloudflare WebSocket
+
+> 选 `proxy-cdn` 等价于 `sb cdn on`。
 
 ### Tun 模式 route_exclude_address
 
@@ -346,7 +367,7 @@ sb export [name]                # 生成 iPhone sing-box 配置
 sb export [name] --sub <url>    # 生成 iPhone 配置（使用机场订阅节点）
 sb serve [name]                 # 起临时 HTTP 服务供 iPhone 拉取
 sb sub <url> [name]             # 订阅转换（有 name 则生成 config-<name>.json）
-sb select [tag|idx]             # 列出/切换 selector 节点（配合 -c 使用）
+sb select [tag|idx|auto]        # 列出/切换节点（auto 切回 urltest 自动模式）
 sb check [IP]                   # 检测 VPS IP 是否被封
 sb update                       # 更新 geosite/geoip 规则集
 sb -c file.json mixed           # 指定配置文件
