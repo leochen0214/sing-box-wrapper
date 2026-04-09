@@ -30,41 +30,43 @@ ln -s ~/.config/sing-box/sb /usr/local/bin/sb
 
 ### A.1 获取凭据到 .env
 
+不带 profile 名会使用默认的 `.env`，所有命令最简。
+
 **方式一（推荐）：SSH 自动提取**
 
-前提：本机 `~/.ssh/config` 里已配置 VPS 的 SSH alias，可以 `ssh dmit` 免密连接。
+前提：本机 `~/.ssh/config` 里已配置 VPS 的 SSH alias，可以 `ssh myvps` 免密连接。
 
 ```bash
-sb import dmit --ssh dmit    # 从 VPS 的 s-ui 数据库自动提取凭据到 .env.dmit
+sb import --ssh myvps        # 默认用法：从 VPS 自动提取凭据到 .env
 ```
+
+`sb import` 会 SSH 到 VPS，读取 s-ui 数据库，把 UUID、密码、公钥、SNI 等所有凭据写入 `.env`。
 
 **方式二：手动填写**
 
 ```bash
-cp .env.example .env.dmit    # 复制模板
-vim .env.dmit                # 手动填入 VPS_IP/UUID/密码/公钥等
+cp .env.example .env         # 复制模板
+vim .env                     # 手动填入 VPS_IP/UUID/密码/公钥等
 ```
 
 ### A.2 生成 config.json
 
 ```bash
-sb init dmit                 # → config-dmit.json
+sb init                      # 默认用法：从 .env → config.json
 ```
 
-`config.template.json` 是模板（入库），`.env.dmit` 是凭据（.gitignore），两者合并生成 `config-dmit.json`。
+`config.template.json` 是模板（入库），`.env` 是凭据（.gitignore），两者合并生成 `config.json`。
 
 ### A.3 启动代理
 
 ```bash
-sb -c config-dmit.json           # mixed 模式，默认，系统代理 127.0.0.1:10887
-sb -c config-dmit.json tun       # tun 模式，全局接管（自动 sudo）
+sb                           # 默认用法：读取 config.json，mixed 模式
+sb tun                       # tun 模式，全局接管（自动 sudo）
 ```
 
 两种模式对比见 [mixed vs tun](#mixed-vs-tun)。
 
-运行中直接 `sb -c config-dmit.json tun`/`mixed` 可以平滑切换，Ctrl+C 停止并清理。
-
-> **省略 `-c`**：如果只用一个 VPS，把 `config-dmit.json` 改名成 `config.json` 即可 `sb` 直接启动。
+运行中直接 `sb tun` / `sb mixed` 可以平滑切换，Ctrl+C 停止并清理。
 
 ### A.4 切换代理节点
 
@@ -85,23 +87,36 @@ sb select auto               # 切回 urltest 自动选最快
 sb stop && sb                # 切换后重启生效
 ```
 
-### A.5 多 VPS 切换
+### A.5 多 VPS 切换（进阶）
 
-每个 VPS 一个 `.env.<name>`，每次 `sb init <name>` 生成对应 `config-<name>.json`：
+当有多个 VPS 时，用**命名 profile** 给每个 VPS 一套独立的 env + config 文件。带 profile 名的命令行为如下：
+
+| 默认 | 带 name |
+|---|---|
+| `sb import --ssh myvps` | `sb import dmit --ssh dmit` |
+| `.env` | `.env.dmit` |
+| `sb init` | `sb init dmit` |
+| `config.json` | `config-dmit.json` |
+| `sb` | `sb -c config-dmit.json` |
 
 ```bash
-sb init dmit                 # → config-dmit.json
-sb init vps                  # → config-vps.json
-sb -c config-dmit.json       # 启动 dmit
-sb -c config-vps.json        # 切到 vps
+# 初始化两个 VPS
+sb import dmit --ssh dmit && sb init dmit     # → .env.dmit + config-dmit.json
+sb import vps  --ssh vps  && sb init vps      # → .env.vps  + config-vps.json
+
+# 运行不同 VPS
+sb -c config-dmit.json                         # 启动 dmit
+sb -c config-vps.json                          # 切到 vps
 ```
 
 ### A.6 导出到 iPhone sing-box (SFI)
 
 ```bash
-sb export dmit               # → export-dmit.json（已做 SFI 1.11 兼容转换）
-sb serve dmit                # 起临时 HTTP 服务，显示拉取 URL
+sb export                    # → export.json（已做 SFI 1.11 兼容转换）
+sb serve                     # 起临时 HTTP 服务，显示拉取 URL
 ```
+
+多 VPS：`sb export dmit` → `export-dmit.json`，`sb serve dmit` 提供该文件。
 
 iPhone：Profiles → New Profile → Type: **Remote** → 粘贴 URL → 保存 → Mac 上 Ctrl+C 关闭服务。
 
@@ -111,7 +126,7 @@ iPhone：Profiles → New Profile → Type: **Remote** → 粘贴 URL → 保存
 >
 > 拉取前先关闭 iPhone 上 sing-box 的 Enabled 开关，否则 tun 会拦截局域网访问。
 
-或者 AirDrop `export-dmit.json` 到 iPhone，选择用 sing-box 打开。
+或者 AirDrop `export.json` 到 iPhone，选择用 sing-box 打开。
 
 ### A.7 VPS IP 被封时
 
