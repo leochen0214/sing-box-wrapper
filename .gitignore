@@ -25,6 +25,10 @@ cache.db
 
 # CDN 优选缓存
 cdn-ips.txt
+cfst
+cfst_hosts.sh
+ip.txt
+ipv6.txt
 
 # WireGuard 配置（含密钥）
 wgcf-*.toml

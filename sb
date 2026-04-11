@@ -377,14 +377,17 @@ with open('$BASE_CONFIG', 'w') as f:
     cdn)
         action="${2:-}"
         CDN_IPS_FILE="$DIR/cdn-ips.txt"
-        # 读取当前 proxy-cdn IP
-        _cdn_current_ip=$(python3 -c "
+        CFST="$DIR/cfst"
+        # 读取当前 proxy-cdn IP 和域名
+        read -r _cdn_current_ip _cdn_domain <<< $(python3 -c "
 import json
 with open('$BASE_CONFIG') as f:
     c = json.load(f)
 for ob in c['outbounds']:
     if ob.get('tag') == 'proxy-cdn':
-        print(ob['server']); break
+        ip = ob.get('server','')
+        domain = ob.get('transport',{}).get('headers',{}).get('Host','')
+        print(ip, domain); break
 ")
         # 更新 proxy-cdn IP
         _cdn_set_ip() {
@@ -422,15 +425,42 @@ print(' '.join(ips))
         # 测试单个 IP 的 WebSocket 连通性，输出 "HTTP状态码 耗时秒"
         _cdn_test_ip() {
             curl -s -o /dev/null -w "%{http_code} %{time_total}" \
-                --resolve "nongliba.cc:443:$1" \
+                --resolve "$_cdn_domain:443:$1" \
                 --noproxy '*' --max-time 5 \
                 -H "Upgrade: websocket" -H "Connection: Upgrade" \
                 -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
                 -H "Sec-WebSocket-Version: 13" \
-                https://nongliba.cc/ws 2>/dev/null || echo "000 99.000"
+                "https://$_cdn_domain/ws" 2>/dev/null || echo "000 99.000"
         }
         # 并行测试所有 IP，结果保存到 cdn-ips.txt，最优 IP 写入 stdout
         _cdn_test_all() {
+            # 优先使用 CloudflareSpeedTest（覆盖更多 IP，更精准）
+            if [ -x "$CFST" ]; then
+                echo "使用 CloudflareSpeedTest 测速..." >&2
+                local tmp_csv
+                tmp_csv=$(mktemp /tmp/cfst.XXXXXX.csv)
+                ( cd "$DIR" && "$CFST" -url "https://$_cdn_domain/ws" -tl 300 -sl 0 -n 200 -t 4 -p 0 -o "$tmp_csv" ) >&2 2>&1
+                # 解析 CSV：IP,Sent,Received,Loss%,AvgDelay,DownloadSpeed
+                > "$CDN_IPS_FILE"
+                local best_ip="" best_ms=99999
+                while IFS=',' read -r ip sent recv loss delay speed; do
+                    # 跳过表头
+                    [ "$ip" = "IP 地址" ] || [ "$ip" = "IP" ] && continue
+                    [ -z "$ip" ] && continue
+                    local ms=$(printf "%.0f" "$delay" 2>/dev/null)
+                    [ -z "$ms" ] || [ "$ms" -le 0 ] 2>/dev/null && continue
+                    printf "  %-18s ✓  %dms\n" "$ip" "$ms" >&2
+                    echo "$ip $ms" >> "$CDN_IPS_FILE"
+                    if [ "$ms" -lt "$best_ms" ]; then
+                        best_ip="$ip"; best_ms="$ms"
+                    fi
+                done < "$tmp_csv"
+                rm -f "$tmp_csv"
+                sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
+                echo "$best_ip $best_ms"
+                return
+            fi
+            # Fallback：curl 方式测试（仅 ~16 个 IP）
             local cf_ips tmp_dir
             echo "获取 Cloudflare IP 列表..." >&2
             cf_ips=$(_cdn_fetch_ips)
@@ -439,7 +469,7 @@ print(' '.join(ips))
                 *" $_cdn_current_ip "*) ;;
                 *) cf_ips="$_cdn_current_ip $cf_ips" ;;
             esac
-            echo "测试 $(echo $cf_ips | wc -w | tr -d ' ') 个 IP 延迟..." >&2
+            echo "测试 $(echo $cf_ips | wc -w | tr -d ' ') 个 IP 延迟...（安装 cfst 可测更多 IP: sb cdn install）" >&2
             tmp_dir=$(mktemp -d)
             for ip in $cf_ips; do
                 ( _cdn_test_ip "$ip" > "$tmp_dir/$ip" ) &
@@ -465,6 +495,28 @@ print(' '.join(ips))
             sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
             echo "$best_ip $best_ms"
         }
+        if [ "$action" = "install" ]; then
+            if [ -x "$CFST" ]; then
+                echo "CloudflareSpeedTest 已安装: $CFST"
+                "$CFST" -v 2>&1 | head -1
+                exit 0
+            fi
+            arch=$(uname -m)
+            case "$arch" in
+                arm64|aarch64) cfst_arch="arm64" ;;
+                x86_64|amd64) cfst_arch="amd64" ;;
+                *) echo "不支持的架构: $arch"; exit 1 ;;
+            esac
+            cfst_url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_darwin_${cfst_arch}.zip"
+            echo "下载 CloudflareSpeedTest (darwin/$cfst_arch)..."
+            curl -fLo /tmp/cfst.zip "$cfst_url" || { echo "下载失败"; exit 1; }
+            unzip -o /tmp/cfst.zip -d "$DIR" >/dev/null
+            chmod +x "$CFST"
+            rm -f /tmp/cfst.zip
+            echo "已安装: $CFST"
+            "$CFST" -v 2>&1 | head -1
+            exit 0
+        fi
         if [ "$action" = "ip" ]; then
             echo "当前 CDN IP: $_cdn_current_ip"
             result=$(_cdn_test_all)
@@ -535,12 +587,14 @@ with open('$BASE_CONFIG') as f:
     c = json.load(f)
 print('on' if c.get('_cdn_enabled') else 'off')
 ")
-            echo "CDN 中转: $current  IP: $_cdn_current_ip"
-            echo "用法: sb cdn [on|off|ip|list|set]"
+            echo "CDN 中转: $current  IP: $_cdn_current_ip  域名: $_cdn_domain"
+            echo "用法: sb cdn [on|off|ip|list|set|install]"
             echo "  on/off    CDN 中转开关"
-            echo "  ip        测试所有 Cloudflare IP 并保存可用列表"
+            echo "  ip        测试 Cloudflare IP 并保存可用列表"
             echo "  list      查看已保存的可用 IP"
             echo "  set <N>   切换到第 N 个 IP（序号来自 list）"
+            echo "  install   安装 CloudflareSpeedTest（测更多 IP，更精准）"
+            [ -x "$CFST" ] && echo "  [cfst 已安装]" || echo "  [cfst 未安装，使用 curl 基础测速]"
             exit 0
         fi
         python3 -c "
