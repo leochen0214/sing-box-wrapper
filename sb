@@ -1542,6 +1542,7 @@ echo "启动 sing-box ($CMD 模式)..."
 echo "$CMD" > "$MODE_FILE"
 
 if [ "$CMD" = "tun" ]; then
+    sudo -v || { echo "需要 sudo 权限"; exit 1; }
     sudo sing-box run -c "$RUN_CONFIG" -D "$DIR" &
 else
     sing-box run -c "$RUN_CONFIG" -D "$DIR" &
