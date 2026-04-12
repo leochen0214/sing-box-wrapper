@@ -86,6 +86,7 @@ disable_system_proxy() {
 stop_singbox() {
     local is_tun=false
     [ -f "$MODE_FILE" ] && [ "$(cat "$MODE_FILE")" = "tun" ] && is_tun=true
+    $is_tun && sudo -v 2>/dev/null
 
     if [ -f "$PID_FILE" ]; then
         local pid
