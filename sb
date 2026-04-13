@@ -510,7 +510,7 @@ print(' '.join(ips))
             cfst_url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_darwin_${cfst_arch}.zip"
             echo "下载 CloudflareSpeedTest (darwin/$cfst_arch)..."
             curl -fLo /tmp/cfst.zip "$cfst_url" || { echo "下载失败"; exit 1; }
-            unzip -o /tmp/cfst.zip -d "$DIR" >/dev/null
+            unzip -o /tmp/cfst.zip cfst -d "$DIR" >/dev/null
             chmod +x "$CFST"
             rm -f /tmp/cfst.zip
             echo "已安装: $CFST"
