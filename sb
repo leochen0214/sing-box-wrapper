@@ -438,8 +438,8 @@ print(' '.join(ips))
             if [ -x "$CFST" ]; then
                 echo "使用 CloudflareSpeedTest 测速..." >&2
                 local tmp_csv
-                tmp_csv=$(mktemp /tmp/cfst.XXXXXX.csv)
-                ( cd "$DIR" && "$CFST" -url "https://$_cdn_domain/ws" -tl 300 -sl 0 -n 200 -t 4 -p 0 -o "$tmp_csv" ) >&2 2>&1
+                tmp_csv=$(mktemp /tmp/cfst.XXXXXX)
+                ( cd "$DIR" && "$CFST" -url "https://$_cdn_domain/ws" -tl 300 -sl 0 -n 200 -t 4 -p 10 -o "$tmp_csv" ) >&2 2>&1
                 # 解析 CSV：IP,Sent,Received,Loss%,AvgDelay,DownloadSpeed
                 > "$CDN_IPS_FILE"
                 local best_ip="" best_ms=99999
@@ -457,8 +457,8 @@ print(' '.join(ips))
                 done < "$tmp_csv"
                 rm -f "$tmp_csv"
                 sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
-                echo "$best_ip $best_ms"
-                return
+                [ -n "$best_ip" ] && echo "$best_ip $best_ms"
+                return 0
             fi
             # Fallback：curl 方式测试（仅 ~16 个 IP）
             local cf_ips tmp_dir
@@ -493,7 +493,8 @@ print(' '.join(ips))
             done
             rm -rf "$tmp_dir"
             sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
-            echo "$best_ip $best_ms"
+            [ -n "$best_ip" ] && echo "$best_ip $best_ms"
+            return 0
         }
         if [ "$action" = "install" ]; then
             if [ -x "$CFST" ]; then
@@ -580,6 +581,71 @@ print(' '.join(ips))
             fi
             exit 0
         fi
+        if [ "$action" = "test" ]; then
+            target="${3:-$_cdn_current_ip}"
+            # 支持序号（从 cdn-ips.txt 选取）
+            if echo "$target" | grep -qE '^[0-9]+$' && [ "$target" -le 99 ] 2>/dev/null; then
+                if [ -f "$CDN_IPS_FILE" ] && [ -s "$CDN_IPS_FILE" ]; then
+                    line=$(sed -n "${target}p" "$CDN_IPS_FILE")
+                    if [ -n "$line" ]; then
+                        target=$(echo "$line" | awk '{print $1}')
+                    fi
+                fi
+            fi
+            if [ -z "$target" ]; then
+                echo "无目标 IP，用法: sb cdn test [IP|序号]"
+                exit 1
+            fi
+            echo "测试 $target (5 次 TCP 握手)..."
+            if [ -x "$CFST" ]; then
+                tmp_csv=$(mktemp /tmp/cfst-test.XXXXXX.csv)
+                ( cd "$DIR" && "$CFST" -ip "$target" -t 5 -tl 9999 -sl 0 -p 0 -dn 0 -o "$tmp_csv" ) >/dev/null 2>&1
+                parsed=0
+                while IFS=',' read -r ip sent recv loss delay _; do
+                    [ "$ip" = "IP 地址" ] || [ "$ip" = "IP" ] && continue
+                    [ -z "$ip" ] && continue
+                    printf "  %-18s 发送: %s  接收: %s  丢包: %s  平均: %sms\n" \
+                        "$ip" "$sent" "$recv" "$loss" "$delay"
+                    parsed=1
+                done < "$tmp_csv"
+                rm -f "$tmp_csv"
+                [ "$parsed" = "0" ] && echo "  $target  全部超时"
+            else
+                sent=5; recv=0; total_ms=0; min_ms=99999; max_ms=0
+                for i in 1 2 3 4 5; do
+                    t=$(curl -s -o /dev/null -w "%{time_connect}" \
+                        --resolve "$_cdn_domain:443:$target" \
+                        --noproxy '*' --connect-timeout 3 --max-time 4 \
+                        "https://$_cdn_domain/" 2>/dev/null)
+                    ms=$(python3 -c "
+import sys
+try:
+    v = float('$t' or 0)
+    print(int(v*1000) if v > 0 else 0)
+except:
+    print(0)
+" 2>/dev/null)
+                    if [ "${ms:-0}" -gt 0 ] 2>/dev/null; then
+                        recv=$((recv + 1))
+                        total_ms=$((total_ms + ms))
+                        [ "$ms" -lt "$min_ms" ] && min_ms=$ms
+                        [ "$ms" -gt "$max_ms" ] && max_ms=$ms
+                        printf "  [%d/5] %dms\n" "$i" "$ms"
+                    else
+                        printf "  [%d/5] 超时\n" "$i"
+                    fi
+                done
+                if [ "$recv" -gt 0 ]; then
+                    avg=$((total_ms / recv))
+                    loss=$(( (sent - recv) * 100 / sent ))
+                    printf "%-18s 发送: %d  接收: %d  丢包: %d%%  平均: %dms  (最小: %dms  最大: %dms)\n" \
+                        "$target" "$sent" "$recv" "$loss" "$avg" "$min_ms" "$max_ms"
+                else
+                    printf "%-18s 全部超时 (5/5)\n" "$target"
+                fi
+            fi
+            exit 0
+        fi
         if [ "$action" != "on" ] && [ "$action" != "off" ]; then
             current=$(python3 -c "
 import json
@@ -588,12 +654,13 @@ with open('$BASE_CONFIG') as f:
 print('on' if c.get('_cdn_enabled') else 'off')
 ")
             echo "CDN 中转: $current  IP: $_cdn_current_ip  域名: $_cdn_domain"
-            echo "用法: sb cdn [on|off|ip|list|set|install]"
-            echo "  on/off    CDN 中转开关"
-            echo "  ip        测试 Cloudflare IP 并保存可用列表"
-            echo "  list      查看已保存的可用 IP"
-            echo "  set <N>   切换到第 N 个 IP（序号来自 list）"
-            echo "  install   安装 CloudflareSpeedTest（测更多 IP，更精准）"
+            echo "用法: sb cdn [on|off|ip|list|set|test|install]"
+            echo "  on/off         CDN 中转开关"
+            echo "  ip             测试 Cloudflare IP 并保存可用列表"
+            echo "  list           查看已保存的可用 IP"
+            echo "  set <IP|N>     切换到指定 IP 或第 N 个（序号来自 list）"
+            echo "  test [IP|N]    测试当前或指定 IP 延迟（5 次 TCP 握手）"
+            echo "  install        安装 CloudflareSpeedTest（测更多 IP，更精准）"
             [ -x "$CFST" ] && echo "  [cfst 已安装]" || echo "  [cfst 未安装，使用 curl 基础测速]"
             exit 0
         fi
@@ -1316,7 +1383,7 @@ SELECT_EOF
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
-        echo "  cdn [on|off|ip|list|set] CDN 中转 / 优选 IP"
+        echo "  cdn [on|off|ip|list|set|test] CDN 中转 / 优选 IP"
         echo "  check [IP]     检测 IP 是否被封（默认使用配置中的 VPS IP）"
         echo "  update         更新规则集（geosite/geoip）"
         exit 1

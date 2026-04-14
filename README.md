@@ -137,11 +137,12 @@ iPhone：Profiles → New Profile → Type: **Remote** → 粘贴 URL → 保存
 sb check                     # 检测当前 VPS IP 是否被封
 sb cdn install               # 首次：安装 CloudflareSpeedTest（测 200+ IP）
 sb cdn ip                    # 测试 Cloudflare IP 延迟，自动选最优
+sb cdn test [IP|N]           # 复测当前/指定 IP 延迟（5 次 TCP 握手，验证丢包）
 sb select proxy-cdn          # 切到 CDN 节点
 sb stop && sb
 ```
 
-`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb select proxy-cdn` 等价于旧版的 `sb cdn on`。
+`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（发现某些网络下 CDN IP 会被间歇性丢包）。`sb select proxy-cdn` 等价于旧版的 `sb cdn on`。
 
 ---
 
@@ -263,7 +264,7 @@ sb serve [name]                   # 起临时 HTTP 服务供 iPhone 拉取
 
 # 维护
 sb check [IP]                     # 检测 IP 是否被封
-sb cdn [on|off|ip|list|set|install] # CDN 中继管理（install 安装 CloudflareSpeedTest）
+sb cdn [on|off|ip|list|set|test|install]  # CDN 中继管理（test 复测单个 IP 延迟）
 sb log [level]                    # 日志级别（info/warn/error/debug）
 sb update                         # 更新 geosite/geoip 规则集
 ```
