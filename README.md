@@ -142,7 +142,7 @@ sb select proxy-cdn          # 切到 CDN 节点
 sb stop && sb
 ```
 
-`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（发现某些网络下 CDN IP 会被间歇性丢包）。`sb select proxy-cdn` 等价于旧版的 `sb cdn on`。
+`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（发现某些网络下 CDN IP 会被间歇性丢包）。启用 CDN 中转走 `sb select proxy-cdn`（`proxy` 是 selector，把 `proxy-cdn` 选为 default 即可）。
 
 ---
 
@@ -264,7 +264,7 @@ sb serve [name]                   # 起临时 HTTP 服务供 iPhone 拉取
 
 # 维护
 sb check [IP]                     # 检测 IP 是否被封
-sb cdn [on|off|ip|list|set|test|install]  # CDN 中继管理（test 复测单个 IP 延迟）
+sb cdn [ip|list|set|test|install] # CDN IP 优选（启用中转用 sb select proxy-cdn）
 sb log [level]                    # 日志级别（info/warn/error/debug）
 sb update                         # 更新 geosite/geoip 规则集
 ```
@@ -274,6 +274,7 @@ sb update                         # 更新 geosite/geoip 规则集
 ```
 ~/.config/sing-box/
 ├── sb                          # macOS 启动脚本（入库）
+├── lib.py                      # sb 调用的 Python 工具库（入库）
 ├── sb.ps1 / sb.bat             # Windows 版
 │
 ├── config.template.json        # 配置模板，${VAR} 占位符（入库）

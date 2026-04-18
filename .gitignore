@@ -40,3 +40,7 @@ corp-bypass-domains.txt
 # 脚本备份
 *.bak
 __pycache__/
+
+# IDE
+.idea/
+.vscode/
