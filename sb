@@ -46,10 +46,13 @@ lib() { python3 "$DIR/lib.py" "$@"; }
 current_pid()  { [ -f "$PID_FILE" ] && cat "$PID_FILE"; }
 current_mode() { [ -f "$MODE_FILE" ] && cat "$MODE_FILE"; }
 
+# ps -p 能跨 UID 检测进程存在；kill -0 对 root 进程从用户态会返回 EPERM 被误判为不存在
+pid_alive() { [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1; }
+
 is_running() {
     local pid
     pid=$(current_pid) || return 1
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    pid_alive "$pid"
 }
 
 mode_is_proxy() {
@@ -127,14 +130,14 @@ stop_singbox() {
     if [ -f "$PID_FILE" ]; then
         local pid
         pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_alive "$pid"; then
             echo "停止 sing-box (PID $pid)..."
             if $is_tun; then
                 sudo kill "$pid" 2>/dev/null || true
             else
                 kill "$pid" 2>/dev/null || true
             fi
-            while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
+            while pid_alive "$pid"; do sleep 0.2; done
         fi
         rm -f "$PID_FILE"
     fi
@@ -154,8 +157,9 @@ show_status() {
         mode=$(current_mode)
         echo "sing-box 运行中 (PID $pid, 模式 ${mode:-?})"
     else
+        # 不在这里 rm PID 文件：可能是 kill -0 对跨 UID 进程的误判，删了反而掩盖问题
+        # 真正的清理发生在 stop_singbox / mode 切换路径
         echo "sing-box 未运行"
-        rm -f "$PID_FILE"
     fi
 }
 
@@ -727,7 +731,7 @@ else
     sb_pid=$!
 fi
 
-if kill -0 "$sb_pid" 2>/dev/null; then
+if pid_alive "$sb_pid"; then
     echo "sing-box 已启动 (PID $sb_pid)"
     mode_is_proxy && enable_system_proxy
 else
@@ -747,8 +751,8 @@ cleanup() {
 trap cleanup INT TERM
 
 # wait 只能等待当前 shell 的子进程；TUN 模式下 sing-box 是 sudo 的子进程
-# 捕获 PID 一次，避免循环中重复 cat PID 文件（文件消失时 kill -0 "" 可能假阳性）
+# 捕获 PID 一次，避免循环中重复 cat PID 文件
 _wait_pid="$sb_pid"
-while kill -0 "$_wait_pid" 2>/dev/null; do
+while pid_alive "$_wait_pid"; do
     sleep 1
 done
