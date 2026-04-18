@@ -510,28 +510,16 @@ case "$CMD" in
             fi
             exit 0
         fi
-        if [ "$action" != "on" ] && [ "$action" != "off" ]; then
-            current=$(lib cdn-status "$BASE_CONFIG")
-            echo "CDN 中转: $current  IP: $_cdn_current_ip  域名: $_cdn_domain"
-            echo "用法: sb cdn [on|off|ip|list|set|test|install]"
-            echo "  on/off         CDN 中转开关"
-            echo "  ip             测试 Cloudflare IP 并保存可用列表"
-            echo "  list           查看已保存的可用 IP"
-            echo "  set <IP|N>     切换到指定 IP 或第 N 个（序号来自 list）"
-            echo "  test [IP|N]    测试当前或指定 IP 延迟（5 次 TCP 握手）"
-            echo "  install        安装 CloudflareSpeedTest（测更多 IP，更精准）"
-            [ -x "$CFST" ] && echo "  [cfst 已安装]" || echo "  [cfst 未安装，使用 curl 基础测速]"
-            exit 0
-        fi
-        lib cdn-toggle "$BASE_CONFIG" "$action"
-        if [ "$action" = "on" ]; then echo "CDN 中转已开启"; else echo "CDN 中转已关闭"; fi
-        if is_running && [ -f "$MODE_FILE" ]; then
-            mode=$(current_mode)
-            echo "重启 $mode 模式以生效..."
-            exec "$0" "${_CONFIG_FLAG[@]}" "$mode"
-        else
-            echo "下次启动时生效"
-        fi
+        echo "CDN IP: $_cdn_current_ip  域名: $_cdn_domain"
+        echo "用法: sb cdn [ip|list|set|test|install]"
+        echo "  ip             测试 Cloudflare IP 并保存可用列表"
+        echo "  list           查看已保存的可用 IP"
+        echo "  set <IP|N>     切换到指定 IP 或第 N 个（序号来自 list）"
+        echo "  test [IP|N]    测试当前或指定 IP 延迟（5 次 TCP 握手）"
+        echo "  install        安装 CloudflareSpeedTest（测更多 IP，更精准）"
+        echo ""
+        echo "启用 CDN 中转: sb select proxy-cdn"
+        [ -x "$CFST" ] && echo "[cfst 已安装]" || echo "[cfst 未安装，使用 curl 基础测速]"
         exit 0
         ;;
     check)
@@ -700,7 +688,7 @@ http.createServer((req, res) => {
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
-        echo "  cdn [on|off|ip|list|set|test] CDN 中转 / 优选 IP"
+        echo "  cdn [ip|list|set|test]  优选 / 切换 Cloudflare IP（启用中转用 sb select proxy-cdn）"
         echo "  check [IP]     检测 IP 是否被封（默认使用配置中的 VPS IP）"
         echo "  update         更新规则集（geosite/geoip）"
         exit 1

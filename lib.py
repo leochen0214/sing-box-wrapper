@@ -144,24 +144,6 @@ def cmd_cdn_set_ip(base_config: str, ip: str) -> None:
         json.dump(c, f, indent=2, ensure_ascii=False)
 
 
-def cmd_cdn_toggle(base_config: str, action: str) -> None:
-    with open(base_config) as f:
-        c = json.load(f)
-    if action == 'on':
-        c['_cdn_enabled'] = True
-    else:
-        c.pop('_cdn_enabled', None)
-    with open(base_config, 'w') as f:
-        json.dump(c, f, indent=2, ensure_ascii=False)
-
-
-def cmd_cdn_status(base_config: str) -> None:
-    """打印 on/off。"""
-    with open(base_config) as f:
-        c = json.load(f)
-    print('on' if c.get('_cdn_enabled') else 'off')
-
-
 CDN_FALLBACK_IPS = (
     '104.16.0.1 141.101.114.1 162.159.0.1 172.67.0.1 103.21.244.1 '
     '108.162.192.1 173.245.48.1 188.114.96.1 190.93.240.1 198.41.128.1'
@@ -313,8 +295,8 @@ def cmd_build_run_config(
 
     default_iface_val = default_iface or None
 
-    # CDN 中转标志（模式处理后统一替换）
-    cdn_enabled = config.pop('_cdn_enabled', False)
+    # 清理遗留的 _cdn_enabled 字段（若历史 config.json 还残留），不影响功能
+    config.pop('_cdn_enabled', None)
 
     if cmd == 'mixed':
         config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'tun']
@@ -389,18 +371,6 @@ def cmd_build_run_config(
             ],
             'final': route_final
         }
-
-    # CDN 中转：替换所有 proxy → proxy-cdn（在模式处理之后，确保覆盖 claude 模式重建的 DNS）
-    if cdn_enabled:
-        for s in config.get('dns', {}).get('servers', []):
-            if s.get('detour') == 'proxy':
-                s['detour'] = 'proxy-cdn'
-        for r in config.get('route', {}).get('rules', []):
-            if r.get('outbound') == 'proxy':
-                r['outbound'] = 'proxy-cdn'
-        route_final = config.get('route', {}).get('final')
-        if route_final is None or route_final == 'proxy':
-            config.setdefault('route', {})['final'] = 'proxy-cdn'
 
     with open(run_config, 'w') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
@@ -874,8 +844,6 @@ def main() -> None:
     # cdn
     s = sub.add_parser('cdn-current'); s.add_argument('base_config')
     s = sub.add_parser('cdn-set-ip'); s.add_argument('base_config'); s.add_argument('ip')
-    s = sub.add_parser('cdn-toggle'); s.add_argument('base_config'); s.add_argument('action', choices=['on', 'off'])
-    s = sub.add_parser('cdn-status'); s.add_argument('base_config')
     sub.add_parser('cdn-fetch-ips')
     s = sub.add_parser('cdn-ms'); s.add_argument('seconds')
 
