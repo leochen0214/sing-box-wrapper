@@ -49,10 +49,16 @@ current_mode() { [ -f "$MODE_FILE" ] && cat "$MODE_FILE"; }
 # ps -p 能跨 UID 检测进程存在；kill -0 对 root 进程从用户态会返回 EPERM 被误判为不存在
 pid_alive() { [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1; }
 
+# 精确名字匹配，排除 'sudo sing-box ...' 这类命令行包含 sing-box 的父进程
+sing_box_pid() { pgrep -x sing-box 2>/dev/null | head -1; }
+
+# 先看 PID 文件（记录的是我们这次启动的进程）；若不准，兜底到 pgrep，避免漏检孤儿进程
 is_running() {
     local pid
-    pid=$(current_pid) || return 1
-    pid_alive "$pid"
+    pid=$(current_pid)
+    pid_alive "$pid" && return 0
+    pid=$(sing_box_pid)
+    [ -n "$pid" ]
 }
 
 mode_is_proxy() {
@@ -123,31 +129,24 @@ disable_system_proxy() {
 }
 
 stop_singbox() {
-    local is_tun=false
-    [ "$(current_mode)" = "tun" ] && is_tun=true
-    $is_tun && sudo -v 2>/dev/null
-
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid=$(cat "$PID_FILE")
-        if pid_alive "$pid"; then
-            echo "停止 sing-box (PID $pid)..."
-            if $is_tun; then
-                sudo kill "$pid" 2>/dev/null || true
-            else
-                kill "$pid" 2>/dev/null || true
-            fi
-            while pid_alive "$pid"; do sleep 0.2; done
+    # PID 文件不可信（terminal 挂断或重入场景下可能过期）；pgrep 才是真相
+    local pid
+    pid=$(current_pid)
+    pid_alive "$pid" || pid=$(sing_box_pid)
+    if [ -n "$pid" ] && pid_alive "$pid"; then
+        # 如果进程属于 root（TUN 模式下的 sudo sing-box），自动 sudo
+        local is_root=false
+        [ "$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')" = "0" ] && is_root=true
+        $is_root && sudo -v
+        echo "停止 sing-box (PID $pid)..."
+        if $is_root; then
+            sudo kill "$pid" 2>/dev/null || true
+        else
+            kill "$pid" 2>/dev/null || true
         fi
-        rm -f "$PID_FILE"
+        while pid_alive "$pid"; do sleep 0.2; done
     fi
-
-    # 兜底：如果还有残留进程（仅当前用户，避免误杀）
-    if $is_tun; then
-        sudo pkill -U "$UID" -f "sing-box run -c ${RUN_CONFIG}" 2>/dev/null || true
-    else
-        pkill -U "$UID" -f "sing-box run -c ${RUN_CONFIG}" 2>/dev/null || true
-    fi
+    rm -f "$PID_FILE"
 }
 
 show_status() {
@@ -721,9 +720,9 @@ else
     sing-box run -c "$RUN_CONFIG" -D "$DIR" &
 fi
 
-# 等待 sing-box 进程出现，获取真实 PID（sudo 会 fork，$! 是 sudo 的 PID）
+# 等待 sing-box 进程出现，获取真实 PID（用 -x 精确匹配进程名，避免匹配到 sudo 父进程）
 sleep 1
-sb_pid=$(pgrep -U "$UID" -f "sing-box run -c ${RUN_CONFIG}" 2>/dev/null | head -1)
+sb_pid=$(sing_box_pid)
 if [ -n "$sb_pid" ]; then
     echo "$sb_pid" > "$PID_FILE"
 else
