@@ -747,7 +747,7 @@ cleanup() {
     echo "已停止"
     exit 0
 }
-trap cleanup INT TERM
+trap cleanup INT TERM HUP
 
 # wait 只能等待当前 shell 的子进程；TUN 模式下 sing-box 是 sudo 的子进程
 # 捕获 PID 一次，避免循环中重复 cat PID 文件
