@@ -64,8 +64,11 @@ sb init                      # 默认用法：从 .env → config.json
 
 ```bash
 sb                           # 默认用法：读取 config.json，mixed 模式
-sb tun                       # tun 模式，全局接管（自动 sudo）
+sb tun                       # tun 模式，全局接管（sb 内部会对 sing-box 自动 sudo）
 ```
+
+> **不要加 `sudo` 前缀跑 sb**。TUN 模式 sb 只对 `sing-box run` 本身 sudo，bash 脚本自己以 user 身份跑。
+> 如果用 `sudo sb tun`，PID / MODE / `.config-run.json` 都会被写成 root 所有，下次 `sb mixed`（user 上下文）会碰到 Permission denied。
 
 两种模式对比见 [mixed vs tun](#mixed-vs-tun)。
 
@@ -248,7 +251,7 @@ sb sub <url> [name]               # 订阅转换（有 name 则生成 config-<na
 
 # 启动 / 停止
 sb [mixed]                        # 系统代理模式（默认）
-sb tun                            # TUN 全局模式（sudo）
+sb tun                            # TUN 全局模式（内部自动 sudo，勿加前缀）
 sb claude                         # 仅 proxy-domains.txt 中的域名走代理
 sb stop                           # 停止
 sb status                         # 查看状态

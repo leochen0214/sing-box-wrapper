@@ -23,6 +23,14 @@ MODE_FILE="$DIR/.current-mode"
 CLAUDE_DOMAINS_FILE="$DIR/proxy-domains.txt"
 CORP_BYPASS_FILE="$DIR/corp-bypass-domains.txt"
 
+# 不要用 sudo 调用 sb：TUN 模式 sb 会内部 sudo sing-box，bash 自己保持 user 身份即可。
+# 以 root 跑 bash 会把 PID/MODE/.config-run.json 全写成 root 所有，之后 user 上下文的
+# sb 无法覆盖，出现 Permission denied。
+if [ "${SUDO_USER:-}" ] && [ "$EUID" = 0 ]; then
+    echo "Warning: 不需要 sudo sb。直接 'sb tun' 即可，sb 会对 sing-box 自己提权。" >&2
+    echo "         继续执行，但本次会把 PID/MODE/.config-run.json 写成 root 所有。" >&2
+fi
+
 # 解析 -c 参数（指定配置文件）
 _CONFIG_FLAG=()
 while getopts "c:" opt; do
@@ -51,6 +59,13 @@ pid_alive() { [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1; }
 
 # 精确名字匹配，排除 'sudo sing-box ...' 这类命令行包含 sing-box 的父进程
 sing_box_pid() { pgrep -x sing-box 2>/dev/null | head -1; }
+
+# 检查 TCP 端口是否被占用（不需要 sudo，netstat 能看到所有 listen socket）
+port_in_use() {
+    local port="$1"
+    [ -z "$port" ] && return 1
+    netstat -an -p tcp 2>/dev/null | grep -qE "(127\.0\.0\.1|\*)\.${port}[[:space:]]+.*LISTEN"
+}
 
 # 先看 PID 文件（记录的是我们这次启动的进程）；若不准，兜底到 pgrep，避免漏检孤儿进程
 is_running() {
@@ -707,6 +722,33 @@ if is_running; then
     sleep 0.5
 fi
 
+# 最后一道防线：即便 is_running 没检出，端口还占用就直接报错，比让 sing-box FATAL 更清晰
+if port_in_use "$PROXY_PORT"; then
+    echo "Error: 端口 $PROXY_PORT 已被占用但 sb 检测不到 sing-box 进程"
+    _ln=$(netstat -an -p tcp 2>/dev/null | grep -E "\\.${PROXY_PORT}[[:space:]]+.*LISTEN" | head -1)
+    [ -n "$_ln" ] && echo "  LISTEN: $_ln"
+    _fd_pids=$(lsof -ti:"$PROXY_PORT" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$_fd_pids" ]; then
+        echo "  持有端口 FD 的进程（可能是客户端连接，不一定是占用 LISTEN 的元凶）:"
+        # shellcheck disable=SC2086
+        ps -o pid,user,comm -p $_fd_pids 2>/dev/null | sed 's/^/    /'
+    fi
+    echo "  如是 root sing-box 孤儿: sudo pkill -x sing-box"
+    echo "  如是应用客户端 FD 残留: 重启对应 app，或 sleep 30 等 TCP 超时"
+    exit 1
+fi
+
+# trap 必须在启动 sing-box 之前就装好，否则启动后、trap 前那段窗口里按 Ctrl+C
+# bash 会直接退出（SIGINT 默认动作），sing-box 变成孤儿
+cleanup() {
+    mode_is_proxy && disable_system_proxy
+    stop_singbox
+    rm -f "$MODE_FILE"
+    echo "已停止"
+    exit 0
+}
+trap cleanup INT TERM HUP
+
 # 根据模式生成运行时配置
 lib build-run-config "$BASE_CONFIG" "$RUN_CONFIG" "$DIR" "$CMD" "${DEFAULT_IFACE:-}"
 
@@ -720,12 +762,17 @@ else
     sing-box run -c "$RUN_CONFIG" -D "$DIR" &
 fi
 
-# 等待 sing-box 进程出现，获取真实 PID（用 -x 精确匹配进程名，避免匹配到 sudo 父进程）
-sleep 1
-sb_pid=$(sing_box_pid)
+# 等最多 3 秒让 sing-box 进程起来，然后抓 PID（用 pgrep -x 精确匹配进程名）
+sb_pid=""
+for _ in 1 2 3; do
+    sleep 1
+    sb_pid=$(sing_box_pid)
+    [ -n "$sb_pid" ] && break
+done
 if [ -n "$sb_pid" ]; then
     echo "$sb_pid" > "$PID_FILE"
 else
+    # fallback: 用 $!（可能是 sudo 的 PID，勉强用）
     echo $! > "$PID_FILE"
     sb_pid=$!
 fi
@@ -738,16 +785,6 @@ else
     rm -f "$PID_FILE" "$MODE_FILE"
     exit 1
 fi
-
-# 前台等待，Ctrl+C 退出时自动清理
-cleanup() {
-    mode_is_proxy && disable_system_proxy
-    stop_singbox
-    rm -f "$MODE_FILE"
-    echo "已停止"
-    exit 0
-}
-trap cleanup INT TERM HUP
 
 # wait 只能等待当前 shell 的子进程；TUN 模式下 sing-box 是 sudo 的子进程
 # 捕获 PID 一次，避免循环中重复 cat PID 文件
