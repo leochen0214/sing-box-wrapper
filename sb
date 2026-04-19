@@ -60,20 +60,26 @@ pid_alive() { [ -n "$1" ] && ps -p "$1" >/dev/null 2>&1; }
 # 精确名字匹配，排除 'sudo sing-box ...' 这类命令行包含 sing-box 的父进程
 sing_box_pid() { pgrep -x sing-box 2>/dev/null | head -1; }
 
+# 找到活着的 sing-box PID：PID 文件优先（记录的是我们这次启动的进程），不活就兜底到 pgrep
+# 输出 PID 到 stdout，找不到输出空；主要给 is_running / stop_singbox 共用
+find_singbox_pid() {
+    local pid
+    pid=$(current_pid)
+    if pid_alive "$pid"; then
+        echo "$pid"
+        return 0
+    fi
+    pid=$(sing_box_pid)
+    [ -n "$pid" ] && echo "$pid"
+}
+
+is_running() { [ -n "$(find_singbox_pid)" ]; }
+
 # 检查 TCP 端口是否被占用（不需要 sudo，netstat 能看到所有 listen socket）
 port_in_use() {
     local port="$1"
     [ -z "$port" ] && return 1
     netstat -an -p tcp 2>/dev/null | grep -qE "(127\.0\.0\.1|\*)\.${port}[[:space:]]+.*LISTEN"
-}
-
-# 先看 PID 文件（记录的是我们这次启动的进程）；若不准，兜底到 pgrep，避免漏检孤儿进程
-is_running() {
-    local pid
-    pid=$(current_pid)
-    pid_alive "$pid" && return 0
-    pid=$(sing_box_pid)
-    [ -n "$pid" ]
 }
 
 mode_is_proxy() {
@@ -144,11 +150,9 @@ disable_system_proxy() {
 }
 
 stop_singbox() {
-    # PID 文件不可信（terminal 挂断或重入场景下可能过期）；pgrep 才是真相
     local pid
-    pid=$(current_pid)
-    pid_alive "$pid" || pid=$(sing_box_pid)
-    if [ -n "$pid" ] && pid_alive "$pid"; then
+    pid=$(find_singbox_pid)
+    if [ -n "$pid" ]; then
         # 如果进程属于 root（TUN 模式下的 sudo sing-box），自动 sudo
         local is_root=false
         [ "$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')" = "0" ] && is_root=true
@@ -165,9 +169,9 @@ stop_singbox() {
 }
 
 show_status() {
-    if is_running; then
-        local pid mode
-        pid=$(current_pid)
+    local pid mode
+    pid=$(find_singbox_pid)
+    if [ -n "$pid" ]; then
         mode=$(current_mode)
         echo "sing-box 运行中 (PID $pid, 模式 ${mode:-?})"
     else
