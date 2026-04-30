@@ -20,6 +20,7 @@ BASE_CONFIG="$DIR/config.json"
 RUN_CONFIG="$DIR/.config-run.json"
 PID_FILE="$DIR/.sing-box.pid"
 MODE_FILE="$DIR/.current-mode"
+LAST_CONFIG_FILE="$DIR/.last-config"  # 上次启动时使用的 BASE_CONFIG 绝对路径，用于自动重启
 CLAUDE_DOMAINS_FILE="$DIR/proxy-domains.txt"
 CORP_BYPASS_FILE="$DIR/corp-bypass-domains.txt"
 PROXY_ENV_FILE="$DIR/.sb-proxy.env"
@@ -184,6 +185,23 @@ find_singbox_pid() {
 }
 
 is_running() { [ -n "$(find_singbox_pid)" ]; }
+
+# 配置已落盘改动后调用：sing-box 在跑就重启使生效，没在跑就什么都不做。
+# 关键：用上次启动时记录的 LAST_CONFIG_FILE 重启，而不是当前命令的 _CONFIG_FLAG
+# —— 否则 `sb -c x.json` 启动后用 `sb cdn ip` 触发重启会错用默认 config.json
+restart_running_mode() {
+    is_running && [ -f "$MODE_FILE" ] || return 0
+    local mode last_cfg
+    mode=$(current_mode)
+    echo "重启 $mode 模式以生效..."
+    if [ -f "$LAST_CONFIG_FILE" ]; then
+        last_cfg=$(cat "$LAST_CONFIG_FILE")
+        exec "$0" -c "$last_cfg" "$mode"
+    else
+        # 第一次（无启动记录）：直接 sb mixed/tun/claude，等价用户首次跑 sb
+        exec "$0" "$mode"
+    fi
+}
 
 # 检查 TCP 端口是否被 LISTEN 占用（不需要 sudo）
 port_in_use() { os_port_in_use "$1"; }
@@ -386,7 +404,7 @@ case "$CMD" in
             disable_system_proxy
         fi
         stop_singbox
-        rm -f "$MODE_FILE"
+        rm -f "$MODE_FILE" "$LAST_CONFIG_FILE"
         echo "已停止"
         exit 0
         ;;
@@ -438,10 +456,8 @@ case "$CMD" in
         esac
         lib log-set "$BASE_CONFIG" "$level"
         echo "日志级别已改为: $level"
-        if is_running && [ -f "$MODE_FILE" ]; then
-            mode=$(current_mode)
-            echo "重启 $mode 模式以生效..."
-            exec "$0" "${_CONFIG_FLAG[@]}" "$mode"
+        if is_running; then
+            restart_running_mode
         else
             echo "sing-box 未运行，下次启动时生效"
         fi
@@ -567,10 +583,12 @@ case "$CMD" in
                 echo "当前 $_cdn_current_ip 不可用！"
                 lib cdn-set-ip "$BASE_CONFIG" "$best_ip"
                 echo "已切换: $_cdn_current_ip → $best_ip (${best_ms}ms)"
+                restart_running_mode
             elif [ "$best_ip" = "$_cdn_current_ip" ]; then
                 echo "当前 $_cdn_current_ip 已是最优 (${cur_ms}ms)"
             else
                 echo "当前: $_cdn_current_ip (${cur_ms}ms)  最优: $best_ip (${best_ms}ms)"
+                echo "如需切换: sb cdn set $best_ip"
             fi
             exit 0
         fi
@@ -602,6 +620,7 @@ case "$CMD" in
             else
                 lib cdn-set-ip "$BASE_CONFIG" "$target"
                 echo "已更新: $_cdn_current_ip → $target"
+                restart_running_mode
             fi
             exit 0
         fi
@@ -882,7 +901,7 @@ fi
 cleanup() {
     mode_is_proxy && disable_system_proxy
     stop_singbox
-    rm -f "$MODE_FILE"
+    rm -f "$MODE_FILE" "$LAST_CONFIG_FILE"
     echo "已停止"
     exit 0
 }
@@ -893,6 +912,7 @@ lib build-run-config "$BASE_CONFIG" "$RUN_CONFIG" "$DIR" "$CMD" "${DEFAULT_IFACE
 
 echo "启动 sing-box ($CMD 模式)..."
 echo "$CMD" > "$MODE_FILE"
+echo "$BASE_CONFIG" > "$LAST_CONFIG_FILE"  # 记住本次启动用的配置文件，给 cdn ip/set 等触发的自动重启用
 
 if [ "$CMD" = "tun" ]; then
     sudo -v || { echo "需要 sudo 权限"; exit 1; }

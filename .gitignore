@@ -21,6 +21,8 @@ sub.json
 .sing-box.pid
 .sing-box.log
 .current-mode
+.last-config
+.sb-proxy.env
 cache.db
 
 # CDN 优选缓存

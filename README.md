@@ -74,20 +74,33 @@ sb tun                       # tun 模式，全局接管（sb 内部会对 sing-
 
 运行中直接 `sb tun` / `sb mixed` 可以平滑切换，Ctrl+C 停止并清理。
 
+> **推荐：日常默认走 CDN 中转节点**
+>
+> Cloudflare CDN IP 被封锁的概率远低于 VPS 直连 IP，被封后只需 `sb cdn ip` 重选一个 IP 即可继续用，不必更换 VPS。性能上 `proxy-reality` 直连最快（见 A.4），但 CDN 在稳定性 / 抗封锁上更省心，所以建议作为日常默认：
+>
+> ```bash
+> sb cdn install               # 仅首次：安装 CloudflareSpeedTest
+> sb cdn ip                    # 优选 Cloudflare IP（写入 config.json）
+> sb select proxy-cdn          # 切到 CDN 节点
+> sb stop && sb                # 重启生效
+> ```
+>
+> 之后日常只需 `sb`/`sb tun`，需要纯直连压榨延迟时再 `sb select proxy-reality`。
+
 ### A.4 切换代理节点
 
 自建 VPS 的 `proxy` selector 内置三种出站：
 
 | tag | 协议 | 连接方式 | 特点 |
 |------|-----------|---------|------|
-| `proxy-shadowtls` | ShadowTLS v3 + Shadowsocks | 直连 VPS:443 | 伪装 TLS 握手，抗检测 |
-| `proxy-reality` | VLESS Reality | 直连 VPS:443 | XTLS Vision，性能最好 |
-| `proxy-cdn` | VLESS over Cloudflare WebSocket | CDN 中继 | VPS IP 被封时的备用 |
+| `proxy-cdn` ⭐ | VLESS over Cloudflare WebSocket | CDN 中继 | **日常推荐**：抗封锁，IP 被封一键 `sb cdn ip` 切换 |
+| `proxy-reality` | VLESS Reality | 直连 VPS:443 | XTLS Vision，性能最好（VPS IP 没被封时延迟最低） |
+| `proxy-shadowtls` | ShadowTLS v3 + Shadowsocks | 直连 VPS:443 | 伪装 TLS 握手，抗检测的备选 |
 
 ```bash
 sb select                    # 列出所有节点，* 标记当前
-sb select proxy-reality      # 按 tag 切换
-sb select 2                  # 按序号切换
+sb select proxy-cdn          # 推荐日常使用（CDN 中转）
+sb select proxy-reality      # 切回直连追求最低延迟
 sb select auto               # 切回 urltest 自动选最快
 
 sb stop && sb                # 切换后重启生效
@@ -134,18 +147,23 @@ iPhone：Profiles → New Profile → Type: **Remote** → 粘贴 URL → 保存
 
 或者 AirDrop `export.json` 到 iPhone，选择用 sing-box 打开。
 
-### A.7 VPS IP 被封时
+### A.7 优化 CDN 节点 / VPS IP 被封时
+
+日常用的就是 CDN 节点（A.3 推荐路径），所以下面这组命令是**日常维护**也是**应急切换**：
 
 ```bash
 sb check                     # 检测当前 VPS IP 是否被封
 sb cdn install               # 首次：安装 CloudflareSpeedTest（测 200+ IP）
-sb cdn ip                    # 测试 Cloudflare IP 延迟，自动选最优
+sb cdn ip                    # 测试 Cloudflare IP 延迟，自动选最优（写入 config.json）
+sb cdn list                  # 查看已优选的可用 IP 列表
 sb cdn test [IP|N]           # 复测当前/指定 IP 延迟（5 次 TCP 握手，验证丢包）
-sb select proxy-cdn          # 切到 CDN 节点
-sb stop && sb
+sb cdn set <IP|N>            # 手动切到指定 IP 或第 N 个
+sb stop && sb                # 重启生效
 ```
 
-`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（发现某些网络下 CDN IP 会被间歇性丢包）。启用 CDN 中转走 `sb select proxy-cdn`（`proxy` 是 selector，把 `proxy-cdn` 选为 default 即可）。
+`sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（某些网络下 CDN IP 会被间歇性丢包，用这条筛掉）。
+
+如果当前 IP 突然变慢/断流，最快的应急路径：`sb cdn ip` → `sb stop && sb`。
 
 ---
 

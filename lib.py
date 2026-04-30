@@ -26,15 +26,21 @@ def _detect_sys_dns() -> str | None:
     macOS: scutil --dns 输出 nameserver[0]。
     Linux: 读 /etc/resolv.conf 第一条 nameserver；systemd-resolved 下是 127.0.0.53，
            sing-box 会再走它转发，OK。
-    返回 None 表示没拿到 → build_run_config 里会落回写死的 fallback。
+    跳过 CGNAT (100.64.0.0/10) 范围的 DNS —— 这些通常是 Tailscale MagicDNS /
+    公司 ZTNA 类虚拟接口上的 DNS，但 sing-box 的 direct 出站绑了 default_interface=en0
+    时根本路由不到 utun*，会卡到 DNS 超时（实际现象：百度等国内站全 502）。
+    返回 None 表示没拿到 → build_run_config 里会落回模板默认 (223.5.5.5)。
     """
+    import ipaddress
+    candidate = None
     try:
         if sys.platform == 'darwin':
             out = subprocess.check_output(
                 ['scutil', '--dns'], text=True, stderr=subprocess.DEVNULL)
             for line in out.splitlines():
                 if 'nameserver[0]' in line:
-                    return line.split(':')[-1].strip()
+                    candidate = line.split(':')[-1].strip()
+                    break
         else:  # linux / 其它 unix
             with open('/etc/resolv.conf') as f:
                 for line in f:
@@ -42,10 +48,17 @@ def _detect_sys_dns() -> str | None:
                     if s.startswith('nameserver'):
                         parts = s.split()
                         if len(parts) >= 2:
-                            return parts[1]
+                            candidate = parts[1]
+                            break
     except Exception:
-        pass
-    return None
+        return None
+    if candidate:
+        try:
+            if ipaddress.ip_address(candidate) in ipaddress.ip_network('100.64.0.0/10'):
+                return None  # CGNAT，几乎一定是 Tailscale/VPN 虚拟解析器
+        except ValueError:
+            pass
+    return candidate
 
 
 # ───────────────────────────── init ─────────────────────────────
