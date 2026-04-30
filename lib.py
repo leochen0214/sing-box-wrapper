@@ -19,6 +19,35 @@ import urllib.parse
 import urllib.request
 
 
+# ──────────────────────────── 平台抽象 ────────────────────────────
+
+def _detect_sys_dns() -> str | None:
+    """系统当前的首选 DNS（DHCP 分配的，用于解析公司内网）。
+    macOS: scutil --dns 输出 nameserver[0]。
+    Linux: 读 /etc/resolv.conf 第一条 nameserver；systemd-resolved 下是 127.0.0.53，
+           sing-box 会再走它转发，OK。
+    返回 None 表示没拿到 → build_run_config 里会落回写死的 fallback。
+    """
+    try:
+        if sys.platform == 'darwin':
+            out = subprocess.check_output(
+                ['scutil', '--dns'], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if 'nameserver[0]' in line:
+                    return line.split(':')[-1].strip()
+        else:  # linux / 其它 unix
+            with open('/etc/resolv.conf') as f:
+                for line in f:
+                    s = line.strip()
+                    if s.startswith('nameserver'):
+                        parts = s.split()
+                        if len(parts) >= 2:
+                            return parts[1]
+    except Exception:
+        pass
+    return None
+
+
 # ───────────────────────────── init ─────────────────────────────
 
 def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
@@ -286,12 +315,7 @@ def cmd_build_run_config(
         rules.insert(idx + 1, {'outbound': 'direct', 'domain_suffix': direct_domains})
 
     # 检测系统 DNS（公司 DHCP 分配的 DNS，用于解析内网域名）
-    dns_out = subprocess.check_output(['scutil', '--dns'], text=True)
-    sys_dns = None
-    for line in dns_out.splitlines():
-        if 'nameserver[0]' in line:
-            sys_dns = line.split(':')[-1].strip()
-            break
+    sys_dns = _detect_sys_dns()
 
     default_iface_val = default_iface or None
 
@@ -322,19 +346,21 @@ def cmd_build_run_config(
         with open(os.path.join(dir_path, 'proxy-domains.txt')) as df:
             domains = [line.strip() for line in df if line.strip() and not line.startswith('#')]
         config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'tun']
-        # 检测公司 PAC 代理（从 PAC 文件提取 PROXY host:port）
+        # 检测公司 PAC 代理（macOS 专属，从 networksetup 拿 PAC URL → 解析 PROXY host:port）
+        # Linux 上没有等价机制，跳过。如需支持可后续在 .env 加 CORP_PAC_URL 字段。
         corp_proxy = None
-        try:
-            pac_url = subprocess.check_output(
-                ['networksetup', '-getautoproxyurl', 'Wi-Fi'], text=True)
-            pac_match = re.search(r'URL:\s*(http\S+)', pac_url)
-            if pac_match:
-                pac_content = urllib.request.urlopen(pac_match.group(1), timeout=3).read().decode()
-                proxy_match = re.search(r'PROXY\s+([\w.-]+):(\d+)', pac_content)
-                if proxy_match:
-                    corp_proxy = (proxy_match.group(1), int(proxy_match.group(2)))
-        except Exception:
-            pass
+        if sys.platform == 'darwin':
+            try:
+                pac_url = subprocess.check_output(
+                    ['networksetup', '-getautoproxyurl', 'Wi-Fi'], text=True)
+                pac_match = re.search(r'URL:\s*(http\S+)', pac_url)
+                if pac_match:
+                    pac_content = urllib.request.urlopen(pac_match.group(1), timeout=3).read().decode()
+                    proxy_match = re.search(r'PROXY\s+([\w.-]+):(\d+)', pac_content)
+                    if proxy_match:
+                        corp_proxy = (proxy_match.group(1), int(proxy_match.group(2)))
+            except Exception:
+                pass
         sys_dns = sys_dns or '223.5.5.5'
         config['dns'] = {
             'servers': [

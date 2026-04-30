@@ -22,6 +22,10 @@ PID_FILE="$DIR/.sing-box.pid"
 MODE_FILE="$DIR/.current-mode"
 CLAUDE_DOMAINS_FILE="$DIR/proxy-domains.txt"
 CORP_BYPASS_FILE="$DIR/corp-bypass-domains.txt"
+PROXY_ENV_FILE="$DIR/.sb-proxy.env"
+
+# 平台分流：所有跨平台差异收口到下面 os_* 函数族
+OS="$(uname -s)"   # Darwin / Linux
 
 # 不要用 sudo 调用 sb：TUN 模式 sb 会内部 sudo sing-box，bash 自己保持 user 身份即可。
 # 以 root 跑 bash 会把 PID/MODE/.config-run.json 全写成 root 所有，之后 user 上下文的
@@ -47,6 +51,112 @@ while getopts "c:" opt; do
     esac
 done
 shift $((OPTIND - 1))
+
+# ── 平台抽象层 ───────────────────────────────────────────────────────
+# macOS / Linux 命令差异都收口到这里。规则：调用点不再出现 uname / 平台分支
+# 新增平台只需要在每个函数加一个 case 分支。
+
+# 默认网卡名（macOS: route -n get default；Linux: ip route show default 取 dev 字段）
+os_default_iface() {
+    case "$OS" in
+        Darwin) route -n get default 2>/dev/null | awk '/interface:/{print $2}' ;;
+        Linux)  ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' ;;
+    esac
+}
+
+# 端口是否被 LISTEN 占用：0=占用 1=空闲。注意 macOS netstat -p 选协议 / Linux netstat -p 显示进程，语义反转
+os_port_in_use() {
+    local port="$1"; [ -z "$port" ] && return 1
+    case "$OS" in
+        Darwin) netstat -an -p tcp 2>/dev/null | grep -qE "(127\.0\.0\.1|\*)\.${port}[[:space:]]+.*LISTEN" ;;
+        Linux)  ss -lnt 2>/dev/null | awk -v p=":$port\$" 'NR>1 && $4 ~ p' | grep -q . ;;
+    esac
+}
+
+# 占用某端口的诊断行（用于 LISTEN 冲突时打印一行参考）
+os_listen_line() {
+    local port="$1"
+    case "$OS" in
+        Darwin) netstat -an -p tcp 2>/dev/null | grep -E "\.${port}[[:space:]]+.*LISTEN" | head -1 ;;
+        Linux)  ss -lntp 2>/dev/null | awk -v p=":$port\$" 'NR>1 && $4 ~ p' | head -1 ;;
+    esac
+}
+
+# serve 子命令用：本机主网卡 IPv4
+os_local_ip() {
+    case "$OS" in
+        Darwin) ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null ;;
+        Linux)  hostname -I 2>/dev/null | awk '{print $1}' ;;
+    esac
+}
+
+# CloudflareSpeedTest release 资源名 / 解压方式（Linux 是 tar.gz，不是 zip）
+os_cfst_asset()   { case "$OS" in Darwin) echo "cfst_darwin_$1.zip" ;; Linux) echo "cfst_linux_$1.tar.gz" ;; esac; }
+os_cfst_extract() {
+    case "$OS" in
+        Darwin) unzip -o "$1" cfst -d "$2" >/dev/null ;;
+        Linux)  tar -xzf "$1" -C "$2" cfst ;;
+    esac
+}
+
+# 系统代理：macOS 调 networksetup 改 GUI 设置；Linux server 写 env 文件供 eval 用
+os_enable_proxy() {                     # $1=host $2=port
+    local host="$1" port="$2"
+    case "$OS" in
+        Darwin)
+            networksetup -setwebproxy Wi-Fi "$host" "$port"
+            networksetup -setsecurewebproxy Wi-Fi "$host" "$port"
+            if [ -f "$CORP_BYPASS_FILE" ]; then
+                local -a domains_arr
+                mapfile -t domains_arr < <(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$')
+                [ ${#domains_arr[@]} -gt 0 ] && networksetup -setproxybypassdomains Wi-Fi "${domains_arr[@]}"
+            fi
+            echo "系统代理已开启 (${host}:${port})"
+            ;;
+        Linux)
+            # TODO(USER): 设置 no_proxy 列表 —— 见下方 _linux_no_proxy
+            local nope; nope=$(_linux_no_proxy)
+            cat >"$PROXY_ENV_FILE" <<EOF
+export http_proxy="http://${host}:${port}"
+export https_proxy="http://${host}:${port}"
+export HTTP_PROXY="http://${host}:${port}"
+export HTTPS_PROXY="http://${host}:${port}"
+export no_proxy="${nope}"
+export NO_PROXY="${nope}"
+EOF
+            echo "代理环境已写入 $(basename "$PROXY_ENV_FILE")"
+            echo "在 shell 中启用: eval \"\$(sb env on)\""
+            ;;
+    esac
+}
+
+os_disable_proxy() {
+    case "$OS" in
+        Darwin)
+            networksetup -setwebproxystate Wi-Fi off
+            networksetup -setsecurewebproxystate Wi-Fi off
+            networksetup -setproxybypassdomains Wi-Fi ""
+            echo "系统代理已关闭"
+            ;;
+        Linux)
+            rm -f "$PROXY_ENV_FILE"
+            echo "代理环境文件已清除"
+            echo "已开启代理的 shell 中执行: eval \"\$(sb env off)\""
+            ;;
+    esac
+}
+
+# Linux no_proxy 列表：基础回环 + RFC1918 私网；如有 corp-bypass-domains.txt 把里面的
+# 域名（macOS 风格 *.corp.com → 转成前导点形式 .corp.com）追加进去，与 macOS 行为对齐
+_linux_no_proxy() {
+    local base="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+    if [ -f "$CORP_BYPASS_FILE" ]; then
+        local extra
+        extra=$(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$' | sed 's/^\*\././' | paste -sd, -)
+        [ -n "$extra" ] && base="${base},${extra}"
+    fi
+    echo "$base"
+}
 
 # ── helpers ─────────────────────────────────────────────────────────
 lib() { python3 "$DIR/lib.py" "$@"; }
@@ -75,12 +185,8 @@ find_singbox_pid() {
 
 is_running() { [ -n "$(find_singbox_pid)" ]; }
 
-# 检查 TCP 端口是否被占用（不需要 sudo，netstat 能看到所有 listen socket）
-port_in_use() {
-    local port="$1"
-    [ -z "$port" ] && return 1
-    netstat -an -p tcp 2>/dev/null | grep -qE "(127\.0\.0\.1|\*)\.${port}[[:space:]]+.*LISTEN"
-}
+# 检查 TCP 端口是否被 LISTEN 占用（不需要 sudo）
+port_in_use() { os_port_in_use "$1"; }
 
 mode_is_proxy() {
     local m; m=$(current_mode)
@@ -89,7 +195,7 @@ mode_is_proxy() {
 
 # 这些子命令不需要加载 config.json / 端口
 config_free_cmd() {
-    case "${1:-}" in init|import|export|serve|sub) return 0;; *) return 1;; esac
+    case "${1:-}" in init|import|export|serve|sub|env) return 0;; *) return 1;; esac
 }
 
 # sing-box 运行时打印 "-x http://127.0.0.1:PORT"；否则空
@@ -124,30 +230,13 @@ fi
 # init/import 等不需要读取配置和端口信息
 if ! config_free_cmd "${1:-}"; then
     PROXY_PORT=$(awk '/"type": "mixed"/{found=1} found && /listen_port/{gsub(/[^0-9]/,""); print; exit}' "$BASE_CONFIG")
-    DEFAULT_IFACE=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+    DEFAULT_IFACE=$(os_default_iface)
     [ ${#_CONFIG_FLAG[@]} -gt 0 ] && echo "配置文件: $(basename "$BASE_CONFIG")"
     [ -n "$PROXY_PORT" ] && echo "代理端口: $PROXY_PORT, 默认接口: $DEFAULT_IFACE"
 fi
 
-enable_system_proxy() {
-    networksetup -setwebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
-    networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 "$PROXY_PORT"
-    if [ -f "$CORP_BYPASS_FILE" ]; then
-        local -a domains_arr
-        mapfile -t domains_arr < <(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$')
-        if [ ${#domains_arr[@]} -gt 0 ]; then
-            networksetup -setproxybypassdomains Wi-Fi "${domains_arr[@]}"
-        fi
-    fi
-    echo "系统代理已开启 (127.0.0.1:$PROXY_PORT)"
-}
-
-disable_system_proxy() {
-    networksetup -setwebproxystate Wi-Fi off
-    networksetup -setsecurewebproxystate Wi-Fi off
-    networksetup -setproxybypassdomains Wi-Fi ""
-    echo "系统代理已关闭"
-}
+enable_system_proxy()  { os_enable_proxy 127.0.0.1 "$PROXY_PORT"; }
+disable_system_proxy() { os_disable_proxy; }
 
 stop_singbox() {
     local pid
@@ -305,6 +394,38 @@ case "$CMD" in
         show_status
         exit 0
         ;;
+    env)
+        # eval "$(sb env on)"  → 把代理 export 进当前 shell
+        # eval "$(sb env off)" → unset
+        action="${2:-on}"
+        case "$action" in
+            on)
+                if [ -f "$PROXY_ENV_FILE" ]; then
+                    cat "$PROXY_ENV_FILE"
+                elif is_running; then
+                    # 兜底：sing-box 在跑但 .sb-proxy.env 缺失（macOS 上从未生成过）→ 临时输出
+                    port=$(awk '/"type": "mixed"/{f=1} f && /listen_port/{gsub(/[^0-9]/,"");print;exit}' "$BASE_CONFIG" 2>/dev/null)
+                    if [ -n "$port" ]; then
+                        printf 'export http_proxy="http://127.0.0.1:%s"\n' "$port"
+                        printf 'export https_proxy="http://127.0.0.1:%s"\n' "$port"
+                        printf 'export HTTP_PROXY="http://127.0.0.1:%s"\n' "$port"
+                        printf 'export HTTPS_PROXY="http://127.0.0.1:%s"\n' "$port"
+                        printf 'export no_proxy="localhost,127.0.0.1,::1"\n'
+                        printf 'export NO_PROXY="localhost,127.0.0.1,::1"\n'
+                    else
+                        echo "# 未能从 config.json 读取 mixed 端口" >&2; exit 1
+                    fi
+                else
+                    echo "# sing-box 未运行" >&2; exit 1
+                fi
+                ;;
+            off)
+                echo 'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY'
+                ;;
+            *) echo "用法: eval \"\$(sb env [on|off])\"" >&2; exit 1 ;;
+        esac
+        exit 0
+        ;;
     log)
         level="${2:-}"
         case "$level" in
@@ -415,15 +536,17 @@ case "$CMD" in
             arch=$(uname -m)
             case "$arch" in
                 arm64|aarch64) cfst_arch="arm64" ;;
-                x86_64|amd64) cfst_arch="amd64" ;;
+                x86_64|amd64)  cfst_arch="amd64" ;;
                 *) echo "不支持的架构: $arch"; exit 1 ;;
             esac
-            cfst_url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/cfst_darwin_${cfst_arch}.zip"
-            echo "下载 CloudflareSpeedTest (darwin/$cfst_arch)..."
-            curl -fLo /tmp/cfst.zip "$cfst_url" || { echo "下载失败"; exit 1; }
-            unzip -o /tmp/cfst.zip cfst -d "$DIR" >/dev/null
+            asset=$(os_cfst_asset "$cfst_arch")
+            cfst_url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/${asset}"
+            tmp_archive="/tmp/${asset}"
+            echo "下载 CloudflareSpeedTest ($OS/$cfst_arch)..."
+            curl -fLo "$tmp_archive" "$cfst_url" || { echo "下载失败"; exit 1; }
+            os_cfst_extract "$tmp_archive" "$DIR"
             chmod +x "$CFST"
-            rm -f /tmp/cfst.zip
+            rm -f "$tmp_archive"
             echo "已安装: $CFST"
             "$CFST" -v 2>&1 | head -1
             exit 0
@@ -648,9 +771,9 @@ case "$CMD" in
             echo "Error: $export_file 不存在，请先运行 sb export"
             exit 1
         fi
-        local_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+        local_ip=$(os_local_ip)
         port=9000
-        while lsof -i :"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+        while os_port_in_use "$port"; do
             port=$((port + 1))
         done
         echo ""
@@ -660,7 +783,14 @@ case "$CMD" in
         echo "在 SFI 中: Profiles → New Profile → Type: Remote → 粘贴上面的 URL"
         echo "拉取完成后按 Ctrl+C 关闭"
         echo ""
-        node -e "
+        if command -v python3 >/dev/null 2>&1; then
+            # python3 -m http.server 会暴露整个 cwd → 用 mktemp 隔离，仅暴露 export 文件
+            serve_dir=$(mktemp -d)
+            trap 'rm -rf "$serve_dir"' EXIT
+            cp "$DIR/$export_file" "$serve_dir/"
+            ( cd "$serve_dir" && python3 -m http.server "$port" --bind 0.0.0.0 )
+        elif command -v node >/dev/null 2>&1; then
+            node -e "
 const http = require('http');
 const fs = require('fs');
 const file = '$DIR/${export_file}';
@@ -676,6 +806,10 @@ http.createServer((req, res) => {
     res.writeHead(404); res.end('Not Found');
   }
 }).listen(${port}, '0.0.0.0', () => console.log('服务已启动'));"
+        else
+            echo "Error: 需要 python3 或 node 启动 HTTP 服务" >&2
+            exit 1
+        fi
         exit 0
         ;;
     sub)
@@ -695,7 +829,7 @@ http.createServer((req, res) => {
     mixed|tun|claude)
         ;;
     *)
-        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|log|cdn|check|update|export|serve|sub|select]"
+        echo "用法: sb [-c config_file] [init|import|mixed|tun|claude|stop|status|env|log|cdn|check|update|export|serve|sub|select]"
         echo ""
         echo "  init [profile] 从模板 + .env 生成配置（如 sb init dmit）"
         echo "  import [name]  从 VPS 提取 s-ui 凭据到 .env[.name]"
@@ -709,6 +843,7 @@ http.createServer((req, res) => {
         echo "  select [tag]   列出/切换 selector 节点（配合 -c 使用）"
         echo "  stop           停止 sing-box"
         echo "  status         查看运行状态"
+        echo "  env [on|off]   输出代理 export 语句（Linux 用：eval \"\$(sb env on)\"）"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
         echo "  cdn [ip|list|set|test]  优选 / 切换 Cloudflare IP（启用中转用 sb select proxy-cdn）"
         echo "  check [IP]     检测 IP 是否被封（默认使用配置中的 VPS IP）"
@@ -729,7 +864,7 @@ fi
 # 最后一道防线：即便 is_running 没检出，端口还占用就直接报错，比让 sing-box FATAL 更清晰
 if port_in_use "$PROXY_PORT"; then
     echo "Error: 端口 $PROXY_PORT 已被占用但 sb 检测不到 sing-box 进程"
-    _ln=$(netstat -an -p tcp 2>/dev/null | grep -E "\\.${PROXY_PORT}[[:space:]]+.*LISTEN" | head -1)
+    _ln=$(os_listen_line "$PROXY_PORT")
     [ -n "$_ln" ] && echo "  LISTEN: $_ln"
     _fd_pids=$(lsof -ti:"$PROXY_PORT" 2>/dev/null | tr '\n' ' ')
     if [ -n "$_fd_pids" ]; then
