@@ -503,6 +503,30 @@ case "$CMD" in
                     fi
                 done < "$tmp_csv"
                 rm -f "$tmp_csv"
+                # cfst -n 200 是从 Cloudflare 全段随机抽 IP，当前 IP 大概率没被抽到。
+                # 没抽到就单独补测一次，避免"明明能用却被判不可用 → 误切走"。
+                # 判定门槛与主测速一致（-tl 300），> 300ms 仍判不可用。
+                if [ -n "$_cdn_current_ip" ] \
+                    && ! awk -v ip="$_cdn_current_ip" '$1==ip{f=1;exit} END{exit !f}' "$CDN_IPS_FILE"; then
+                    echo "补测当前 IP $_cdn_current_ip..." >&2
+                    local tmp_csv2 ms2
+                    tmp_csv2=$(mktemp /tmp/cfst-cur.XXXXXX)
+                    ( cd "$DIR" && "$CFST" -ip "$_cdn_current_ip" -url "https://$_cdn_domain/ws" \
+                        -tl 300 -sl 0 -t 4 -p 0 -dn 0 -o "$tmp_csv2" ) >&2 2>&1
+                    while IFS=',' read -r ip sent recv loss delay _; do
+                        [ "$ip" = "IP 地址" ] || [ "$ip" = "IP" ] && continue
+                        [ -z "$ip" ] && continue
+                        ms2=$(printf "%.0f" "$delay" 2>/dev/null)
+                        [ -z "$ms2" ] || [ "$ms2" -le 0 ] 2>/dev/null && continue
+                        printf "  %-18s ✓  %dms (补测)\n" "$ip" "$ms2" >&2
+                        echo "$ip $ms2" >> "$CDN_IPS_FILE"
+                        if [ "$ms2" -lt "$best_ms" ]; then
+                            best_ip="$ip"; best_ms="$ms2"
+                        fi
+                        break
+                    done < "$tmp_csv2"
+                    rm -f "$tmp_csv2"
+                fi
                 sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
                 [ -n "$best_ip" ] && echo "$best_ip $best_ms"
                 return 0
