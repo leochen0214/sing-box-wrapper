@@ -100,23 +100,83 @@ os_cfst_extract() {
     esac
 }
 
+os_proxy_services() {
+    case "$OS" in
+        Darwin) networksetup -listallnetworkservices | tail -n +2 | sed '/^\*/d' ;;
+        Linux)  ;;
+    esac
+}
+
+_default_proxy_bypass_lines() {
+    cat <<'EOF'
+localhost
+127.0.0.1
+::1
+192.168.5.1
+192.168.*
+10.*
+172.16.*
+172.17.*
+172.18.*
+172.19.*
+172.20.*
+172.21.*
+172.22.*
+172.23.*
+172.24.*
+172.25.*
+172.26.*
+172.27.*
+172.28.*
+172.29.*
+172.30.*
+172.31.*
+*.lan
+EOF
+}
+
+proxy_bypass_lines() {
+    {
+        _default_proxy_bypass_lines
+        if [ -f "$CORP_BYPASS_FILE" ]; then
+            grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$'
+        fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+proxy_no_proxy_value() {
+    {
+        printf '%s\n' \
+            localhost 127.0.0.1 ::1 192.168.5.1 \
+            10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 .lan
+        if [ -f "$CORP_BYPASS_FILE" ]; then
+            grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$' | sed 's/^\*\././'
+        fi
+    } | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
 # 系统代理：macOS 调 networksetup 改 GUI 设置；Linux server 写 env 文件供 eval 用
 os_enable_proxy() {                     # $1=host $2=port
     local host="$1" port="$2"
     case "$OS" in
         Darwin)
-            networksetup -setwebproxy Wi-Fi "$host" "$port"
-            networksetup -setsecurewebproxy Wi-Fi "$host" "$port"
-            if [ -f "$CORP_BYPASS_FILE" ]; then
-                local -a domains_arr
-                mapfile -t domains_arr < <(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$')
-                [ ${#domains_arr[@]} -gt 0 ] && networksetup -setproxybypassdomains Wi-Fi "${domains_arr[@]}"
-            fi
+            local domains service_count=0 svc
+            domains=$(proxy_bypass_lines)
+            while IFS= read -r svc; do
+                [ -n "$svc" ] || continue
+                if networksetup -setwebproxy "$svc" "$host" "$port" \
+                    && networksetup -setsecurewebproxy "$svc" "$host" "$port"; then
+                    [ -n "$domains" ] && echo "$domains" | xargs networksetup -setproxybypassdomains "$svc"
+                    service_count=$((service_count + 1))
+                else
+                    echo "Warning: 未能设置 ${svc} 的系统代理" >&2
+                fi
+            done < <(os_proxy_services)
+            [ "$service_count" -gt 0 ] || { echo "Error: 未找到可设置代理的网络服务" >&2; exit 1; }
             echo "系统代理已开启 (${host}:${port})"
             ;;
         Linux)
-            # TODO(USER): 设置 no_proxy 列表 —— 见下方 _linux_no_proxy
-            local nope; nope=$(_linux_no_proxy)
+            local nope; nope=$(proxy_no_proxy_value)
             cat >"$PROXY_ENV_FILE" <<EOF
 export http_proxy="http://${host}:${port}"
 export https_proxy="http://${host}:${port}"
@@ -134,9 +194,13 @@ EOF
 os_disable_proxy() {
     case "$OS" in
         Darwin)
-            networksetup -setwebproxystate Wi-Fi off
-            networksetup -setsecurewebproxystate Wi-Fi off
-            networksetup -setproxybypassdomains Wi-Fi ""
+            local svc
+            while IFS= read -r svc; do
+                [ -n "$svc" ] || continue
+                networksetup -setwebproxystate "$svc" off || true
+                networksetup -setsecurewebproxystate "$svc" off || true
+                networksetup -setproxybypassdomains "$svc" "" || true
+            done < <(os_proxy_services)
             echo "系统代理已关闭"
             ;;
         Linux)
@@ -145,18 +209,6 @@ os_disable_proxy() {
             echo "已开启代理的 shell 中执行: eval \"\$(sb env off)\""
             ;;
     esac
-}
-
-# Linux no_proxy 列表：基础回环 + RFC1918 私网；如有 corp-bypass-domains.txt 把里面的
-# 域名（macOS 风格 *.corp.com → 转成前导点形式 .corp.com）追加进去，与 macOS 行为对齐
-_linux_no_proxy() {
-    local base="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
-    if [ -f "$CORP_BYPASS_FILE" ]; then
-        local extra
-        extra=$(grep -v '^#' "$CORP_BYPASS_FILE" | grep -v '^$' | sed 's/^\*\././' | paste -sd, -)
-        [ -n "$extra" ] && base="${base},${extra}"
-    fi
-    echo "$base"
 }
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -428,8 +480,9 @@ case "$CMD" in
                         printf 'export https_proxy="http://127.0.0.1:%s"\n' "$port"
                         printf 'export HTTP_PROXY="http://127.0.0.1:%s"\n' "$port"
                         printf 'export HTTPS_PROXY="http://127.0.0.1:%s"\n' "$port"
-                        printf 'export no_proxy="localhost,127.0.0.1,::1"\n'
-                        printf 'export NO_PROXY="localhost,127.0.0.1,::1"\n'
+                        nope=$(proxy_no_proxy_value)
+                        printf 'export no_proxy="%s"\n' "$nope"
+                        printf 'export NO_PROXY="%s"\n' "$nope"
                     else
                         echo "# 未能从 config.json 读取 mixed 端口" >&2; exit 1
                     fi
