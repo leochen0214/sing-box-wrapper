@@ -61,6 +61,43 @@ def _detect_sys_dns() -> str | None:
     return candidate
 
 
+def _dns_server_host(server: str) -> str:
+    """Return the hostname/IP part of a sing-box DNS server address."""
+    parsed = urllib.parse.urlparse(server)
+    if parsed.hostname:
+        return parsed.hostname
+    return server.rsplit(':', 1)[0].strip('[]')
+
+
+def _is_domain_server_address(server: str) -> bool:
+    host = _dns_server_host(server)
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        return True
+
+
+def _add_dns_domain_resolvers(config: dict) -> None:
+    servers = config.get('dns', {}).get('servers', [])
+    bootstrap = next(
+        (
+            s.get('tag')
+            for s in servers
+            if s.get('tag') and not _is_domain_server_address(str(s.get('server', '')))
+        ),
+        None,
+    )
+    if not bootstrap:
+        return
+    for server in servers:
+        address = str(server.get('server', ''))
+        if _is_domain_server_address(address) and server.get('tag') != bootstrap:
+            server.setdefault('domain_resolver', bootstrap)
+
+
 # ───────────────────────────── init ─────────────────────────────
 
 def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
@@ -100,6 +137,8 @@ def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
             reality['tag'] = 'proxy'
             kept.insert(0, reality)
         config['outbounds'] = kept
+
+    _add_dns_domain_resolvers(config)
 
     with open(out_file, 'w') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
@@ -410,6 +449,8 @@ def cmd_build_run_config(
             ],
             'final': route_final
         }
+
+    _add_dns_domain_resolvers(config)
 
     with open(run_config, 'w') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
