@@ -871,7 +871,7 @@ def main() -> None:
     # init
     s = sub.add_parser('init-config')
     s.add_argument('env_file')
-    s.add_argument('template')
+    s.add_argument('tpl_file')
     s.add_argument('out_file')
 
     sub.add_parser('remote-import-script')
