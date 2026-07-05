@@ -2,3 +2,5 @@
 # 这些域名会绕过 geoip/geosite 判断，始终走直连
 gsuus.com
 baidu.com
+vip.lz-cdn.com
+www1.ikanbot.com

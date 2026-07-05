@@ -4,5 +4,8 @@
 claude.ai
 anthropic.com
 platform.claude.com
+chatgpt.com
+openai.com
 nongliba.cc
 googlevideo.com
+github.com
