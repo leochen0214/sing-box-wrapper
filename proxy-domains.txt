@@ -9,3 +9,7 @@ openai.com
 nongliba.cc
 googlevideo.com
 github.com
+notion.so
+openaccount.us.moomoo.com
+moomoo.com
+youtube.com

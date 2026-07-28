@@ -4,3 +4,6 @@ gsuus.com
 baidu.com
 vip.lz-cdn.com
 www1.ikanbot.com
+baidu-int.com
+bdstatic.com
+bcebos.com
