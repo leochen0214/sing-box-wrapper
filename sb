@@ -533,6 +533,53 @@ case "$CMD" in
                 -H "Sec-WebSocket-Version: 13" \
                 "https://$_cdn_domain/ws" 2>/dev/null || echo "000 99.000"
         }
+        # cfst 的延迟测速是 TCPing（未加 -httping），只验 TCP 握手。虽然 -dn 默认会对
+        # 延迟最低的 10 个做下载测速（那一步会建 TLS），但 -url 指向的 /ws 没有内容体
+        # 可下载，好坏 IP 的下载速度一律是 0.00 —— speed 字段在这里没有任何区分力，
+        # 想靠 -sl 过滤会把所有 IP 一起干掉。
+        # 于是"TCP 握手成功、TLS ClientHello 之后被 RST"的 IP 无从发现，而这类 IP
+        # 恰恰回得最快，会排到列表最前面被选中，表现为 DNS 全部 connection reset。
+        # 对延迟最低的前 N 个补一次真实 WS 握手，把握手不通的剔除。
+        CDN_VERIFY_TOP=12
+        _cdn_verify_top() {
+            local file="$1" tmp_dir ip ms code t kept=0 dropped=0
+            [ -s "$file" ] || return 0
+            echo "复验 TLS/WS 握手（前 $CDN_VERIFY_TOP 个）..." >&2
+            tmp_dir=$(mktemp -d)
+            while read -r ip ms; do
+                [ -n "$ip" ] || continue
+                ( _cdn_test_ip "$ip" > "$tmp_dir/$ip" ) &
+            done < <(head -n "$CDN_VERIFY_TOP" "$file")
+            wait
+            : > "$tmp_dir/keep"
+            while read -r ip ms; do
+                [ -n "$ip" ] || continue
+                # 前 N 个之外没有探测结果文件，原样保留
+                if [ -f "$tmp_dir/$ip" ]; then
+                    read -r code t < "$tmp_dir/$ip"
+                    # 只认"握手是否完成"，不认具体状态码：服务端将来改了 /ws 的行为
+                    # （400/403/101 都可能）也不会被误杀，只有 000 才是链路不通。
+                    if [ "$code" = "000" ]; then
+                        printf "  %-18s ✗ TLS 握手失败，剔除\n" "$ip" >&2
+                        dropped=$((dropped + 1))
+                        continue
+                    fi
+                    printf "  %-18s ✓ %s\n" "$ip" "$code" >&2
+                fi
+                echo "$ip $ms" >> "$tmp_dir/keep"
+                kept=$((kept + 1))
+            done < "$file"
+            if [ "$kept" -eq 0 ]; then
+                # 全军覆没多半是本机断网/域名解析挂了，而不是这批 IP 真的都坏了。
+                # 此时剔空列表会让 sb cdn ip 无 IP 可选，宁可保留原样交给人判断。
+                echo "警告：所有 IP 握手均失败（疑似本机网络异常），保留原列表未剔除" >&2
+            else
+                mv "$tmp_dir/keep" "$file"
+                [ "$dropped" -gt 0 ] && echo "已剔除 $dropped 个 TCP 通但 TLS 被重置的 IP" >&2
+            fi
+            rm -rf "$tmp_dir"
+        }
+
         # 并行测试所有 IP，结果保存到 cdn-ips.txt，最优 IP 写入 stdout
         _cdn_test_all() {
             # 优先使用 CloudflareSpeedTest（覆盖更多 IP，更精准）
@@ -581,6 +628,10 @@ case "$CMD" in
                     rm -f "$tmp_csv2"
                 fi
                 sort -t' ' -k2 -n -o "$CDN_IPS_FILE" "$CDN_IPS_FILE"
+                # 复验会剔除 IP，best_ip 必须在剔除之后重算 —— 否则可能仍指向刚被剔掉的那个
+                _cdn_verify_top "$CDN_IPS_FILE"
+                best_ip=$(awk 'NR==1{print $1}' "$CDN_IPS_FILE")
+                best_ms=$(awk 'NR==1{print $2}' "$CDN_IPS_FILE")
                 [ -n "$best_ip" ] && echo "$best_ip $best_ms"
                 return 0
             fi
