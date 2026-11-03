@@ -74,6 +74,32 @@ sb tun                       # tun 模式，全局接管（sb 内部会对 sing-
 
 运行中直接 `sb tun` / `sb mixed` 可以平滑切换，Ctrl+C 停止并清理。
 
+### VPS 更换 IP
+
+只修改 `~/.config/sing-box-wrapper/.env` 中的 `VPS_IP`，再运行 `sb`、`sb claude`
+或 `sb tun` 即可，无需手改 `config.json` 或再次执行 `sb init`。
+
+启动时自动同步自建 VPS 的 Reality / ShadowTLS 地址及 TUN 的 IP 排除路由，
+保留节点选择、CDN 优选 IP、DNS 和分流设置；生成并校验新配置后才停止旧实例。
+`.env` 缺失、IP 无效或新配置校验失败时，原有代理继续运行。
+`sb check` 和 `sb export` 也会读取最新 IP。
+
+命名 profile 的 `.env.<name>` 会继承同目录 `.env`，自己的字段优先。
+例如默认配置与 dmit 共用 VPS 时，删除 `.env.dmit` 中的 `VPS_IP` 即可共用 `.env` 的地址，
+`sb init dmit`、`sb import dmit` 和 `sb -c config-dmit.json ...` 均支持继承。
+不同 VPS 的 `.env.vps` 继续显式填写自己的 `VPS_IP`。
+
+配置来源由同目录 `.sb-profiles.json` 自动登记：`sb init` 登记自建配置、对应环境文件及
+模板中使用 `${VPS_IP}` 的出站；`sb sub` 登记订阅配置。启动时只同步已登记的自建出站，
+不根据节点名称或 `.env` 文件是否存在猜测配置来源。备用订阅和未登记的外部配置保持原样。
+
+`.sb-profiles.json` 由 sb 维护，不需要手工修改。已登记的环境文件缺失、绑定的出站被删除、
+重复或改名时会报错，避免继续使用旧地址。配置生成中断时会保留明确的未完成状态，
+重新执行原来的 `sb init` 或 `sb sub` 命令即可修复。
+如果将配置迁移到其他目录，需同时携带对应的来源登记和环境文件，或重新生成配置。
+
+这里统一的是本机 sb 的地址；网站源站 DNS、nongli 的部署地址和其他设备配置仍需单独处理。
+
 > **推荐：日常默认走 CDN 中转节点**
 >
 > Cloudflare CDN IP 被封锁的概率远低于 VPS 直连 IP，被封后只需 `sb cdn ip` 重选一个 IP 即可继续用，不必更换 VPS。性能上 `proxy-reality` 直连最快（见 A.4），但 CDN 在稳定性 / 抗封锁上更省心，所以建议作为日常默认：
@@ -162,6 +188,19 @@ sb stop && sb                # 重启生效
 ```
 
 `sb cdn ip` 优先使用 CloudflareSpeedTest（cfst）测试 200+ 个 IP，未安装时 fallback 到 curl 基础测速（~16 个 IP）。`sb cdn test` 用于快速复测单个 IP 的稳定性（某些网络下 CDN IP 会被间歇性丢包，用这条筛掉）。
+
+安装和升级从 [CloudflareSpeedTest 官方发布](https://github.com/XIU2/CloudflareSpeedTest/releases) 下载：
+
+```bash
+sb cdn install              # 首次安装最新版本；已安装时提示升级命令
+sb cdn version              # 查看本机版本，无需联网
+sb cdn update               # 升级到官方最新版本
+sb cdn update v2.3.5        # 安装指定版本，也可用于回退
+```
+
+升级会先下载并验证新程序，再替换 `cfst`；失败时保留原程序。
+只更新可执行文件，保留 `ip.txt`、`ipv6.txt`、`cdn-ips.txt` 和代理配置，当前 sb 无需重启。
+上述安装维护命令也可在尚未生成 `config.json` 时使用。
 
 如果当前 IP 突然变慢/断流，最快的应急路径：`sb cdn ip` → `sb stop && sb`。
 

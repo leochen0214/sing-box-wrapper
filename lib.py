@@ -14,6 +14,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -100,15 +101,176 @@ def _add_dns_domain_resolvers(config: dict) -> None:
 
 # ───────────────────────────── init ─────────────────────────────
 
-def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
+def _read_env(env_file: str) -> dict[str, str]:
+    """命名 profile 继承同目录 .env，显式设置的字段优先。"""
     env: dict[str, str] = {}
+    default_env = os.path.join(os.path.dirname(os.path.abspath(env_file)), '.env')
+    if os.path.basename(env_file).startswith('.env.') and os.path.isfile(default_env):
+        env.update(_read_env(default_env))
     with open(env_file) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
-            key, _, value = line.partition('=')
-            env[key.strip()] = value.strip()
+            key, sep, value = line.partition('=')
+            if sep:
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                env[key.strip()] = value
+    return env
+
+
+def cmd_env_get(env_file: str, key: str) -> None:
+    print(_read_env(env_file).get(key, ''))
+
+
+def _write_config(config: dict, path: str, check_dir: str | None = None) -> None:
+    """先校验临时文件，再原子替换；失败时保留原配置。"""
+    path = os.path.abspath(path)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', prefix='.sb-config-', suffix='.json',
+            dir=os.path.dirname(path), delete=False,
+        ) as f:
+            tmp = f.name
+            json.dump(config, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        if check_dir is not None:
+            result = subprocess.run(
+                ['sing-box', 'check', '-c', tmp, '-D', os.path.abspath(check_dir)],
+                capture_output=True, text=True,
+            )
+            if result.returncode:
+                raise ValueError(f'配置校验失败：{result.stderr.strip() or result.stdout.strip()}')
+        os.replace(tmp, path)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _read_profiles(config_path: str) -> tuple[str, dict]:
+    path = os.path.join(os.path.dirname(os.path.abspath(config_path)), '.sb-profiles.json')
+    if not os.path.exists(path):
+        return path, {'version': 1, 'profiles': {}}
+    with open(path) as f:
+        registry = json.load(f)
+    if not isinstance(registry, dict) or registry.get('version') != 1 or not isinstance(registry.get('profiles'), dict):
+        raise ValueError(f'{path} 的配置来源登记格式无效')
+    return path, registry
+
+
+def _register_profile(config_path: str, profile: dict | None) -> None:
+    """由生成入口登记来源；不从文件名、节点名或环境文件推断。"""
+    path, registry = _read_profiles(config_path)
+    name = os.path.basename(config_path)
+    if profile is None:
+        registry['profiles'].pop(name, None)
+    else:
+        registry['profiles'][name] = profile
+    _write_config(registry, path)
+
+
+def _write_generated_config(config: dict, path: str, profile: dict, check_dir: str) -> None:
+    # 两个文件不能一起原子替换；中间状态明确禁止同步，防止新订阅沿用旧 VPS 登记。
+    _, registry = _read_profiles(path)
+    previous = registry['profiles'].get(os.path.basename(path))
+    _register_profile(path, {'source': 'pending'})
+    try:
+        _write_config(config, path, check_dir=check_dir)
+    except (ValueError, OSError):
+        _register_profile(path, previous)
+        raise
+    _register_profile(path, profile)
+
+
+def _bound_outbounds(config: dict, profile: dict) -> list[dict]:
+    bindings = profile.get('ip_outbounds')
+    if not isinstance(bindings, dict) or not bindings:
+        raise ValueError('自建配置没有有效的 VPS_IP 出站绑定，请重新执行 sb init')
+    managed = []
+    for tag, expected_type in bindings.items():
+        matches = [ob for ob in config.get('outbounds', []) if ob.get('tag') == tag]
+        if len(matches) != 1 or matches[0].get('type') != expected_type or 'server' not in matches[0]:
+            raise ValueError(f'已登记的 VPS_IP 出站 {tag} 缺失、重复或类型改变，请重新执行 sb init')
+        managed.append(matches[0])
+    return managed
+
+
+def _vps_address(env: dict[str, str], env_file: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    try:
+        return ipaddress.ip_address(env.get('VPS_IP', ''))
+    except ValueError:
+        raise ValueError(f'{env_file} 中的 VPS_IP 必须是有效的 IPv4 或 IPv6 地址') from None
+
+
+def _apply_vps_ip(config: dict, managed: list[dict], address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """只修改已绑定的出站及对应 TUN 排除地址，不读取或写入文件。"""
+    server = str(address)
+    new_cidr = f'{server}/{address.max_prefixlen}'
+    old_cidrs = {'${VPS_IP}/32', '${VPS_IP}/128'}
+    changed = False
+    for ob in managed:
+        old_server = ob.get('server', '')
+        try:
+            old_address = ipaddress.ip_address(old_server)
+            old_cidrs.add(f'{old_address}/{old_address.max_prefixlen}')
+        except ValueError:
+            pass
+        if old_server != server:
+            ob['server'] = server
+            changed = True
+    for ib in config.get('inbounds', []):
+        if ib.get('type') != 'tun':
+            continue
+        old_excludes = ib.get('route_exclude_address', [])
+        excludes = [cidr for cidr in old_excludes if cidr not in old_cidrs]
+        if new_cidr not in excludes:
+            excludes.append(new_cidr)
+        # 保持已有顺序，避免仅因当前 IP 排除项的位置变化而反复写文件。
+        if set(excludes) != set(old_excludes):
+            ib['route_exclude_address'] = excludes
+            changed = True
+    return changed
+
+
+def _load_synced_config(base_config: str, check_dir: str | None = None) -> dict:
+    with open(base_config) as f:
+        config = json.load(f)
+    _, registry = _read_profiles(base_config)
+    profile = registry['profiles'].get(os.path.basename(base_config))
+    if profile is None:
+        return config  # 未登记的外部配置不自动修改。
+    if not isinstance(profile, dict):
+        raise ValueError('配置来源登记格式无效')
+    source = profile.get('source')
+    if source == 'subscription':
+        return config
+    if source == 'pending':
+        raise ValueError('配置生成尚未完成，请重新执行原来的 sb init 或 sb sub 命令')
+    if source != 'vps' or not isinstance(profile.get('env'), str) or not profile['env']:
+        raise ValueError('配置来源或环境文件登记无效')
+
+    managed = _bound_outbounds(config, profile)
+    config_dir = os.path.dirname(os.path.abspath(base_config))
+    env_file = os.path.join(config_dir, profile['env'])
+    address = _vps_address(_read_env(env_file), env_file)
+    if _apply_vps_ip(config, managed, address):
+        # sb 的运行目录是脚本目录，与 -c 配置文件所在目录无关。
+        _write_config(config, base_config, check_dir=check_dir or os.path.dirname(os.path.abspath(__file__)))
+        print(f'已同步 {os.path.basename(base_config)} 的 VPS_IP → {address}', file=sys.stderr)
+    return config
+
+
+def cmd_sync_config(base_config: str) -> None:
+    _load_synced_config(base_config)
+
+
+def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
+    env = _read_env(env_file)
+    address = _vps_address(env, env_file)
+    env['VPS_IP'] = str(address)
 
     # CDN_UUID fallback 到 VLESS_UUID
     if 'CDN_UUID' not in env or not env['CDN_UUID']:
@@ -116,6 +278,10 @@ def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
 
     with open(tpl_file) as f:
         content = f.read()
+    template = json.loads(content)
+    # 绑定来自模板中的显式变量，节点名称仅作为已登记出站的标识。
+    bindings = {ob['tag']: ob['type'] for ob in template.get('outbounds', [])
+                if ob.get('server') == '${VPS_IP}'}
 
     def replace_var(m: re.Match[str]) -> str:
         key = m.group(1)
@@ -126,6 +292,13 @@ def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
 
     content = re.sub(r'\$\{(\w+)\}', replace_var, content)
     config = json.loads(content)
+    if address.version == 6:
+        for ib in config.get('inbounds', []):
+            if ib.get('type') == 'tun':
+                ib['route_exclude_address'] = [
+                    f'{address}/128' if cidr == f'{address}/32' else cidr
+                    for cidr in ib.get('route_exclude_address', [])
+                ]
 
     # 如果 shadowtls 密码为空，移除相关 outbound 并简化 proxy
     ss_pw = env.get('SS_CLIENT_PASSWORD', '')
@@ -137,11 +310,20 @@ def cmd_init_config(env_file: str, tpl_file: str, out_file: str) -> None:
             reality['tag'] = 'proxy'
             kept.insert(0, reality)
         config['outbounds'] = kept
+        reality_binding = bindings.get('proxy-reality')
+        bindings = {tag: kind for tag, kind in bindings.items() if tag not in remove_tags}
+        if reality and reality_binding:
+            bindings['proxy'] = reality_binding
 
     _add_dns_domain_resolvers(config)
 
-    with open(out_file, 'w') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    profile = {
+        'source': 'vps',
+        'env': os.path.relpath(os.path.abspath(env_file), os.path.dirname(os.path.abspath(out_file))),
+        'ip_outbounds': bindings,
+    }
+    _bound_outbounds(config, profile)
+    _write_generated_config(config, out_file, profile, os.path.dirname(os.path.abspath(tpl_file)))
 
 
 # ──────────────────────── import (远程脚本) ────────────────────────
@@ -267,22 +449,25 @@ def cmd_cdn_ms(seconds: str) -> None:
 
 def cmd_check_vps_ips(base_config: str) -> None:
     """输出配置中出现的 VPS IP，每行一个（跳过 proxy-cdn）。"""
-    with open(base_config) as f:
-        c = json.load(f)
+    c = _load_synced_config(base_config)
     seen: set[str] = set()
     for ob in c.get('outbounds', []):
         ip = ob.get('server', '')
-        if ip and ip[0].isdigit() and ip not in seen:
-            if ob.get('tag', '') != 'proxy-cdn':
-                seen.add(ip)
-                print(ip)
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if ip not in seen and ob.get('tag', '') != 'proxy-cdn':
+            seen.add(ip)
+            print(ip)
 
 
 def cmd_check_ports(ip: str) -> None:
     ports = [443, 8443, 22]
     blocked_count = 0
     for port in ports:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        family = socket.AF_INET6 if ipaddress.ip_address(ip).version == 6 else socket.AF_INET
+        s = socket.socket(family, socket.SOCK_STREAM)
         s.settimeout(5)
         start = time.time()
         try:
@@ -345,8 +530,7 @@ def cmd_build_run_config(
     cmd: str,
     default_iface: str,
 ) -> None:
-    with open(base_config) as f:
-        config = json.load(f)
+    config = _load_synced_config(base_config, check_dir=dir_path)
 
     # 读取域名文件注入自定义路由规则（编辑后重启即生效，无需 sb init）
     def read_domains(filename: str) -> list[str]:
@@ -452,8 +636,7 @@ def cmd_build_run_config(
 
     _add_dns_domain_resolvers(config)
 
-    with open(run_config, 'w') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    _write_config(config, run_config, check_dir=dir_path)
 
 
 # ──────────────────────────── export ────────────────────────────
@@ -463,8 +646,11 @@ GEOIP_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set'
 
 
 def cmd_export_ios(base: str, out: str, dir_path: str, sub_url: str) -> None:
-    with open(base) as f:
-        config = json.load(f)
+    if sub_url:
+        with open(base) as f:
+            config = json.load(f)
+    else:
+        config = _load_synced_config(base, check_dir=dir_path)
 
     # 移除 mixed 入站（iPhone 不需要）
     config['inbounds'] = [ib for ib in config['inbounds'] if ib['type'] != 'mixed']
@@ -826,8 +1012,7 @@ def cmd_sub_parse(sub_url: str, curl_proxy: str, dir_path: str, sub_name: str) -
                 ib['route_exclude_address'] = sorted(node_ips) if node_ips else []
 
         out_cfg = os.path.join(dir_path, f'config-{sub_name}.json')
-        with open(out_cfg, 'w') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        _write_generated_config(config, out_cfg, {'source': 'subscription'}, dir_path)
         print(f'\n完整配置已生成: config-{sub_name}.json ({len(node_ips)} 个节点 IP 加入 route_exclude_address)')
         print(f'  运行: sb -c config-{sub_name}.json mixed')
         print(f'  切换节点: sb -c config-{sub_name}.json select <tag>')
@@ -915,6 +1100,12 @@ def main() -> None:
     s.add_argument('tpl_file')
     s.add_argument('out_file')
 
+    s = sub.add_parser('env-get')
+    s.add_argument('env_file')
+    s.add_argument('key')
+    s = sub.add_parser('sync-config')
+    s.add_argument('base_config')
+
     sub.add_parser('remote-import-script')
 
     # log
@@ -970,7 +1161,10 @@ def main() -> None:
         sys.exit(2)
 
     kwargs = {k: v for k, v in vars(args).items() if k != 'verb'}
-    func(**kwargs)
+    try:
+        func(**kwargs)
+    except (ValueError, OSError) as e:
+        p.exit(1, f'Error: {e}\n')
 
 
 if __name__ == '__main__':

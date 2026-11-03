@@ -100,6 +100,75 @@ os_cfst_extract() {
     esac
 }
 
+# -v 会访问网络检查更新；读取本机版本用 -h，避免离线时等待。
+cfst_version() {
+    "$1" -h 2>&1 | awk '/^CloudflareSpeedTest v[0-9]/{print $2}'
+}
+
+manage_cfst() (
+    # 子 shell 的清理 trap 只负责本次下载，不影响正在运行的 sb。
+    action="$1"
+    version="${2:-latest}"
+    target="$DIR/cfst"
+    current=""
+    if [ -x "$target" ]; then
+        current=$(cfst_version "$target") || current=""
+    fi
+    if [ "$action" = "version" ]; then
+        [ -n "$current" ] || { echo "CloudflareSpeedTest 未安装或无法读取版本，请运行 sb cdn install"; exit 1; }
+        echo "CloudflareSpeedTest $current ($target)"
+        exit 0
+    fi
+    if [ "$action" = "install" ] && [ -n "$current" ]; then
+        echo "CloudflareSpeedTest 已安装: $current"
+        echo "升级请运行: sb cdn update"
+        exit 0
+    fi
+    if [ "$version" != "latest" ] && ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "版本格式: v2.3.5；用法: sb cdn update [版本]"
+        exit 1
+    fi
+    case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64|amd64) arch="amd64" ;;
+        *) echo "不支持的架构: $(uname -m)"; exit 1 ;;
+    esac
+    asset=$(os_cfst_asset "$arch")
+    [ -n "$asset" ] || { echo "不支持的系统: $OS"; exit 1; }
+    if [ "$version" = "latest" ]; then
+        url="https://github.com/XIU2/CloudflareSpeedTest/releases/latest/download/$asset"
+    else
+        url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/$version/$asset"
+    fi
+    tmp_dir=$(mktemp -d "$DIR/.cfst-install.XXXXXX")
+    trap 'rm -rf "$tmp_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    echo "下载 CloudflareSpeedTest $version ($OS/$arch)，当前: ${current:-未安装}..."
+    curl -fL --connect-timeout 10 --max-time 120 --retry 2 -o "$tmp_dir/$asset" "$url" \
+        || { echo "下载失败，原程序保持不变"; exit 1; }
+    os_cfst_extract "$tmp_dir/$asset" "$tmp_dir" \
+        || { echo "解压失败，原程序保持不变"; exit 1; }
+    chmod +x "$tmp_dir/cfst"
+    candidate=$(cfst_version "$tmp_dir/cfst") \
+        || { echo "新程序无法运行，原程序保持不变"; exit 1; }
+    if ! [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "无法确认新程序版本，原程序保持不变"
+        exit 1
+    fi
+    if [ "$version" != "latest" ] && [ "$candidate" != "$version" ]; then
+        echo "下载的程序版本 $candidate 与指定的 $version 不符，原程序保持不变"
+        exit 1
+    fi
+    if [ "$candidate" = "$current" ]; then
+        echo "已是目标版本: $current"
+        exit 0
+    fi
+    # 临时目录与目标位于同一文件系统，只替换程序，不解压覆盖 ip.txt 等数据。
+    mv -f "$tmp_dir/cfst" "$target"
+    echo "CloudflareSpeedTest 已安装: ${candidate}（原版本: ${current:-无}）"
+)
+
 os_proxy_services() {
     case "$OS" in
         Darwin) networksetup -listallnetworkservices | tail -n +2 | sed '/^\*/d' ;;
@@ -286,6 +355,16 @@ resolve_cdn_target() {
     echo "$input"
 }
 
+# 安装、升级和查看 cfst 版本不依赖代理配置，也不切换正在运行的代理。
+if [ "${1:-}" = "cdn" ]; then
+    case "${2:-}" in
+        install|update|version)
+            manage_cfst "$2" "${3:-latest}"
+            exit 0
+            ;;
+    esac
+fi
+
 # 配置文件不存在时提示 init（init 命令本身不需要 config.json）
 if [ ! -f "$BASE_CONFIG" ] && ! config_free_cmd "${1:-}"; then
     if [ -f "$DIR/config.template.json" ]; then
@@ -368,14 +447,7 @@ _sb_init() {
     fi
 
     lib init-config "$env_file" "$tpl" "$out"
-
-    if sing-box check -c "$out" 2>/dev/null; then
-        echo "$(basename "$out") 已生成（配置验证通过）"
-    else
-        echo "$(basename "$out") 已生成，但配置验证失败："
-        sing-box check -c "$out" 2>&1
-        exit 1
-    fi
+    echo "$(basename "$out") 已生成（配置验证通过）"
 }
 
 case "$CMD" in
@@ -413,8 +485,14 @@ case "$CMD" in
                 exit 1
             fi
         fi
-        vps_ip=$(grep '^VPS_IP=' "$env_file" | head -1 | cut -d= -f2)
+        # 命名 profile 未设置 VPS_IP 时继承同目录 .env，导入后也保留继承关系。
+        inherit_vps_ip=false
+        if [ -n "$profile" ] && ! grep -q '^[[:space:]]*VPS_IP[[:space:]]*=' "$env_file"; then
+            inherit_vps_ip=true
+        fi
+        vps_ip=$(lib env-get "$env_file" VPS_IP)
         if [ -z "$vps_ip" ] && [ -n "$ssh_host" ]; then
+            inherit_vps_ip=false  # 没有可继承的地址时，将 SSH 地址写入 profile
             vps_ip=$(ssh -G "$ssh_host" 2>/dev/null | awk '/^hostname /{print $2}')
             [ -z "$vps_ip" ] && vps_ip="$ssh_host"
         elif [ -z "$vps_ip" ]; then
@@ -439,7 +517,11 @@ case "$CMD" in
         credentials=$(echo "$credentials" | grep -v '^CDN_DOMAIN=')
         {
             echo "# ${profile} VPS (${vps_ip})"
-            echo "VPS_IP=${vps_ip}"
+            if $inherit_vps_ip; then
+                echo "# VPS_IP 继承同目录 .env"
+            else
+                echo "VPS_IP=${vps_ip}"
+            fi
             echo "$credentials"
             echo "CDN_IP=${cdn_ip}"
             echo "CDN_DOMAIN=${cdn_domain}"
@@ -671,30 +753,6 @@ case "$CMD" in
             [ -n "$best_ip" ] && echo "$best_ip $best_ms"
         }
 
-        if [ "$action" = "install" ]; then
-            if [ -x "$CFST" ]; then
-                echo "CloudflareSpeedTest 已安装: $CFST"
-                "$CFST" -v 2>&1 | head -1
-                exit 0
-            fi
-            arch=$(uname -m)
-            case "$arch" in
-                arm64|aarch64) cfst_arch="arm64" ;;
-                x86_64|amd64)  cfst_arch="amd64" ;;
-                *) echo "不支持的架构: $arch"; exit 1 ;;
-            esac
-            asset=$(os_cfst_asset "$cfst_arch")
-            cfst_url="https://github.com/XIU2/CloudflareSpeedTest/releases/download/v2.3.4/${asset}"
-            tmp_archive="/tmp/${asset}"
-            echo "下载 CloudflareSpeedTest ($OS/$cfst_arch)..."
-            curl -fLo "$tmp_archive" "$cfst_url" || { echo "下载失败"; exit 1; }
-            os_cfst_extract "$tmp_archive" "$DIR"
-            chmod +x "$CFST"
-            rm -f "$tmp_archive"
-            echo "已安装: $CFST"
-            "$CFST" -v 2>&1 | head -1
-            exit 0
-        fi
         if [ "$action" = "ip" ]; then
             echo "当前 CDN IP: $_cdn_current_ip"
             result=$(_cdn_test_all)
@@ -803,12 +861,14 @@ case "$CMD" in
             exit 0
         fi
         echo "CDN IP: $_cdn_current_ip  域名: $_cdn_domain"
-        echo "用法: sb cdn [ip|list|set|test|install]"
+        echo "用法: sb cdn [ip|list|set|test|install|update|version]"
         echo "  ip             测试 Cloudflare IP 并保存可用列表"
         echo "  list           查看已保存的可用 IP"
         echo "  set <IP|N>     切换到指定 IP 或第 N 个（序号来自 list）"
         echo "  test [IP|N]    测试当前或指定 IP 延迟（5 次 TCP 握手）"
         echo "  install        安装 CloudflareSpeedTest（测更多 IP，更精准）"
+        echo "  update [版本]  升级到最新版本，或安装指定版本（如 v2.3.5）"
+        echo "  version        查看本机 CloudflareSpeedTest 版本"
         echo ""
         echo "启用 CDN 中转: sb select proxy-cdn"
         [ -x "$CFST" ] && echo "[cfst 已安装]" || echo "[cfst 未安装，使用 curl 基础测速]"
@@ -992,12 +1052,16 @@ http.createServer((req, res) => {
         echo "  status         查看运行状态"
         echo "  env [on|off]   输出代理 export 语句（Linux 用：eval \"\$(sb env on)\"）"
         echo "  log [level]    切换日志级别（info/warn/error/debug），运行中自动重启"
-        echo "  cdn [ip|list|set|test]  优选 / 切换 Cloudflare IP（启用中转用 sb select proxy-cdn）"
+        echo "  cdn [ip|list|set|test|install|update|version]  优选 IP / 管理测速工具"
         echo "  check [IP]     检测 IP 是否被封（默认使用配置中的 VPS IP）"
         echo "  update         更新规则集（geosite/geoip）"
         exit 1
         ;;
 esac
+
+# 读取 .env 同步 VPS IP、生成并校验运行配置后，才停止现有实例。
+# .env 或配置有误时直接退出，正在使用的代理继续运行。
+lib build-run-config "$BASE_CONFIG" "$RUN_CONFIG" "$DIR" "$CMD" "${DEFAULT_IFACE:-}"
 
 # 如果已在运行，先停掉
 if is_running; then
@@ -1034,9 +1098,6 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM HUP
-
-# 根据模式生成运行时配置
-lib build-run-config "$BASE_CONFIG" "$RUN_CONFIG" "$DIR" "$CMD" "${DEFAULT_IFACE:-}"
 
 echo "启动 sing-box ($CMD 模式)..."
 echo "$CMD" > "$MODE_FILE"
